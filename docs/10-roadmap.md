@@ -40,7 +40,9 @@ the run's health. Replay reproduces both from recorded data.
 
 ## M4 · Remote agents
 
-- `trun agent` with enrollment, outbound WSS, heartbeats
+- `trun agent` over SSH (`trun hosts add`, `--install`, `--stdio`) and join mode (outbound WSS), heartbeats
+- Agent-side configurable downsampling (t-digest percentiles, moments, NaN preservation)
+- User-level daemons (systemd --user with linger, Scheduled Task, LaunchAgent), `trun doctor`
 - Spool and resume with gap backfill
 - NVML GPU sampling, per-process GPU attribution, GPU default checks
 - Remote exec (opt-in), config sync of `.trun/` to the hub
@@ -65,7 +67,7 @@ without manual prompting.
 ## M6 · Desktop app & polish
 
 - Tauri shell with a tray icon (fleet health color), native notifications, deep links
-- TS panels (sandboxed iframe, in-browser transpile)
+- TS panels (hub-side oxc compile, sandboxed iframe, optional tsgo type check)
 - Run comparison view, `trun diff`
 - Phone-friendly UI plus ntfy push
 - Task templates with args
@@ -75,13 +77,11 @@ without manual prompting.
 - Preemption detection (AWS/GCP/Azure plus the SIGTERM fallback)
 - Cost tracking and `idle_shutdown_after`, `shutdown_host` action
 - Artifact upload plus gallery panels
-- Optional Cloudflare relay (no-VPN connectivity)
 - AMD ROCm sampling
 
 ## Later / maybe
 
 - Helper libraries for Rust and TypeScript
 - Ingesting TensorBoard event files as metrics
-- Shared or team hubs with multiple users
 - Run-to-run automatic regression detection ("this test got 40% slower")
 - Plugin marketplace for parsers and panels

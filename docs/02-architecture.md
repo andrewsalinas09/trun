@@ -20,8 +20,8 @@ just runs `trun hub`, which includes a local agent.
 ```
  Remote host (GPU cloud, Pi, CI)             Desktop / hub host
  ┌─────────────────────────────┐             ┌──────────────────────────────┐
- │ trun agent                  │  outbound   │ trun hub                     │
- │  ├─ supervisor(s)           │  WSS        │  ├─ embedded agent (local)   │
+ │ trun agent                  │ SSH channel │ trun hub                     │
+ │  ├─ supervisor(s)           │  or WSS     │  ├─ embedded agent (local)   │
  │  ├─ system + GPU sampler    │ ──────────▶ │  ├─ SQLite history           │
  │  ├─ checks (Rhai)           │ ◀────────── │  ├─ HTTP + WS API            │
  │  ├─ parsers                 │  commands   │  ├─ web UI (static assets)   │
@@ -32,7 +32,8 @@ just runs `trun hub`, which includes a local agent.
                                          / phone            trun wait / CLI
 ```
 
-- **Agents always dial out.** Remote hosts never need an inbound port. See
+- **Single user, self-hosted.** Remote hosts connect over the user's SSH (the hub
+  dials in) or a tailnet (the agent dials out). Nothing is exposed publicly. See
   [07 Remote](07-remote.md).
 - **Local IPC.** `trun run` and other CLI commands talk to the local daemon over a
   Unix domain socket (Linux/macOS) or a named pipe (Windows).
@@ -104,6 +105,9 @@ and digests show both.
 | System stats | sysinfo | Cross-platform |
 | GPU stats | nvml-wrapper (NVIDIA); ROCm SMI later | |
 | File watching | notify | Hot reload of `.trun/` |
+| TS panel compiler | oxc | Native Rust TS/TSX transform and bundling on the hub. Nothing heavy in the browser |
+| Remote transport | russh (SSH mode), tokio-tungstenite (join mode) | SSH reuses the user's existing keys and config |
+| Downsampling | t-digest sketches + streaming moments | User-chosen aggregates, including any percentile, at bounded memory |
 | MCP | rmcp (official Rust SDK) | |
 | CLI | clap | |
 | UI framework | Svelte 5 + Vite + TypeScript | Small, fast, easy for AI to edit |

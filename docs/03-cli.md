@@ -84,12 +84,16 @@ trun emit step-end compile ok
 
 ```sh
 trun hub [--listen 0.0.0.0:7317] [--data-dir …]
-trun hub token create --name gpu1 [--ttl 1h] [--allow-exec]
+trun hosts add <ssh-host> [--install]                 # SSH mode: hub dials the host
+trun hosts remove <host>
+trun hub token create --name gpu1 [--ttl 1h] [--allow-exec]   # join mode
 trun hub token list | revoke <id>
 
 trun agent --join wss://hub:7317 --token <join-token>    # first time: enroll
 trun agent                                             # subsequent: use stored credential
-trun agent install-service                             # systemd / Windows service / launchd
+trun agent --stdio                                     # used by the hub over SSH; not run by hand
+trun agent install-service                             # user-level: systemd --user / scheduled task / LaunchAgent
+trun doctor                                            # check daemon, GPU access, shutdown permission, connectivity
 ```
 
 ## Authoring helpers (for humans and AI)
@@ -100,6 +104,8 @@ trun check test <file> --run RUN   # replay a check against a recorded run's dat
 trun parse test <file> < sample.log # show which events a parser emits for input
 trun ui                         # open the UI (Tauri app if installed, else browser)
 trun mcp                        # stdio MCP server
+trun init claude [--project]    # register MCP, add CLAUDE.md rule, install PreToolUse hook
+trun hook claude-pretool        # the hook itself (reads hook JSON on stdin)
 ```
 
 `trun check test` and `trun parse test` exist so an agent can iterate on a check or

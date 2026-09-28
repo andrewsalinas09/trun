@@ -104,6 +104,37 @@ MCP calls are request/response, so the agent can't be pushed events over MCP. In
 This turns "remember to check on it later" into an interrupt. `start_run` returns the
 exact `trun wait` command line to use.
 
+## trun as the default launcher for long commands
+
+The value comes from trun seeing *every* long-running command, not only the ones an
+agent remembers to wrap. trun is therefore the recommended way for an agent to launch
+anything long, and `trun init claude` sets this up in one step:
+
+1. **MCP registration:** `claude mcp add trun -- trun mcp`.
+2. **CLAUDE.md rule** (added to the user or project CLAUDE.md):
+
+   ```markdown
+   ## Long-running commands → trun
+   Launch any command likely to take more than ~1 minute (tests, builds, training,
+   benchmarks, scrapers) through trun, never bare:
+   - `trun run -d --name <short-name> -- <cmd>` → prints run id
+   - then run `trun wait <id> --until done,failed,stalled,lost,preempted` in the background
+   - on wake-up, read the digest; use trun MCP tools (`tail_logs`, `query_metric`) to dig in
+   - check `read_notes` for messages from the human before acting on a finished run
+   Never report a run as successful without a digest showing `succeeded`.
+   ```
+
+3. **Hook safety net.** A `PreToolUse` hook on Bash catches long commands that skipped
+   trun: any call with `run_in_background: true` whose command isn't already `trun …`.
+   Where the hook API allows rewriting tool input, the hook wraps the command as
+   `trun run --name <derived> -- <cmd>` transparently. Otherwise it blocks the call
+   with a message telling the agent to relaunch through trun. The hook is a small
+   subcommand, `trun hook claude-pretool`, which reads the hook JSON on stdin, so there
+   is no shell-quoting fragility.
+
+With all three in place, a background command can't disappear into a black box, even
+when the agent forgets the convention.
+
 ## Resources (optional)
 
 - `trun://runs/{id}/digest` is the live digest.

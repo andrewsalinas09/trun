@@ -95,6 +95,11 @@ no_progress = "15m"
 gpu_idle = "10m"
 disk_warn = "2GB"
 
+[downsample]                          # see 07-remote.md#downsampling
+window = "5s"
+keep_raw = "10m"
+aggregates = ["min", "max", "mean", "std", "last", "p10", "p50", "p99"]
+
 [notify]
 desktop = true
 ntfy = { topic = "trun-alerts" }     # phone push via ntfy.sh (optional)

@@ -55,8 +55,14 @@ A general-purpose run monitor. Any command, on any machine, gets:
 - A full log-analytics platform (Grafana/Loki scale).
 - Orchestrating or scheduling across a cluster. trun runs and watches commands, and
   doesn't allocate resources.
-- Multi-tenant or team SaaS. The design is single-user first. Sharing is an open
-  question.
+- Multiple users, teams, or hosted SaaS. trun is **self-hosted, for one person and
+  their own machines**, connected over SSH or a private network such as Tailscale.
+
+## Design stance
+
+trun is designed from first principles for this problem. Nothing is borrowed from an
+existing tool and bent to fit. Every piece should be the best answer for trun's needs,
+chosen because it is good, not because it saves time.
 
 ## Use cases
 

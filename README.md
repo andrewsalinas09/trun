@@ -1,7 +1,5 @@
 # trun
 
-> Working name. See [open questions](docs/11-open-questions.md).
-
 **Live visibility into long-running tasks, shared by humans and AI agents.**
 
 When an AI agent kicks off a test suite, a build, or a training run, the work often
@@ -18,14 +16,15 @@ cloud box, a Raspberry Pi, or a CI runner.
 # Local: zero instrumentation needed
 trun run --name train-v3 -- python train.py --epochs 50
 
-# On a cloud GPU box, one line in the startup script
-curl -fsSL https://…/install.sh | sh && trun agent --join wss://hub.tailnet:7317 --token $TRUN_TOKEN
+# Add a remote box you can already ssh into (installs trun there too)
+trun hosts add gpu1 --install
+trun run --host gpu1 -- python train.py
 
 # Agent (or you) blocks until something happens worth reacting to
 trun wait train-v3 --until done,failed,stalled
 ```
 
-## Core ideas
+## Core principles
 
 1. **Supervision first, instrumentation second.** The supervisor owns the process,
    so a run that crashes or never produces output is still visible. Structure such
@@ -39,9 +38,11 @@ trun wait train-v3 --until done,failed,stalled
 4. **Everything configurable is a file.** Panels, checks, parsers, and task templates
    live in `.trun/` as plain files that hot-reload. The agent customizes monitoring
    by editing files, the same way it edits code.
-5. **Local and remote are the same thing.** Every machine runs the same binary.
-   Agents dial out to a hub, so it works behind NAT, survives disconnects, and costs
-   nothing to add to an ephemeral cloud box.
+5. **Local and remote are the same thing.** Every machine runs the same binary. Hosts
+   connect over your existing SSH or tailnet. Runs survive disconnects, and adding an
+   ephemeral cloud box costs nothing.
+6. **Self-hosted, single user.** Your machines, your data. There's no service to sign
+   up for.
 
 ## Documentation
 

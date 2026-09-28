@@ -108,8 +108,22 @@ export default function render({ run, plot, Plot, el }: PanelContext) {
 export const refresh = { onMetric: ["confusion_matrix"], throttleMs: 2000 };
 ```
 
-- The file is transpiled in the browser (esbuild-wasm or sucrase) on load. There is
-  no build step.
+- There is no build step for the user. The **hub compiles panels natively with
+  [oxc](https://oxc.rs)**, a Rust TypeScript/TSX parser, transformer, and linter,
+  embedded in the trun binary. Compiling takes about a millisecond per file, and
+  nothing heavy is shipped to the browser, so it works the same in Tauri, a desktop
+  browser, or a phone.
+- Compile errors are reported with file, line, and column, both in the panel and
+  through `get_errors`, so an AI can fix its own panel.
+- **Type checking.** oxc strips types but does not check them. trun ships a
+  `trun-panel.d.ts` for the `PanelContext` API, which gives autocomplete and types in
+  any editor. If `tsgo` (the native TypeScript compiler) or `tsc` is on PATH,
+  `trun lint` and `write_panel` also run a full type check and report type errors.
+  Without it, panels still work, and the full check becomes available once it is
+  installed.
+- Imports: `trun:panel` (types and helpers) and a vendored `@observablehq/plot` are
+  resolved by the hub. Relative imports between panel files are bundled by oxc.
+  Network imports are not allowed.
 - It runs in a **sandboxed iframe** with no network and no access to the parent page,
   and talks to the host through a message-passing `PanelContext`.
 - `PanelContext` provides read-only data access (`run.metric(name)`, `run.steps`,
