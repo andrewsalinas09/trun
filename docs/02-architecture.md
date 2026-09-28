@@ -61,7 +61,8 @@ just runs `trun hub`, which includes a local agent.
 
 ```
 Host      id, name, os, arch, gpus[], agent_version, last_seen, status(online|offline)
-Run       id(ULID), name, host_id, template?, cmd, cwd, env_digest,
+Project   name, root_hint, git_remote?, db_path, created_at
+Run       id(ULID), project, name, host_id, template?, cmd, cwd, env_digest,
           lifecycle, health, started_at, ended_at, exit_code, signal,
           diagnosis?, parent_run?        -- for runs spawned by runs
 Step      run_id, id, parent_id?, name, state, current?, total?, unit?, started_at, ended_at
@@ -72,6 +73,56 @@ Alert     run_id, check, level, message, first_at, last_at, cleared_at?
 Note      run_id, author(human|agent), ts, text, read_by_agent_at?
 Artifact  run_id, path, kind, size, hash, stored_at
 ```
+
+## Storage layout: one SQLite file per project
+
+```
+~/.trun/data/
+  hub.db                         # small global index
+  projects/
+    detector.db                  # everything for project "detector"
+    firmware.db
+    _adhoc.db                    # runs outside any project
+  artifacts/<project>/…          # uploaded artifact files (content-addressed)
+```
+
+| File | Holds |
+|---|---|
+| `hub.db` | Hosts, host samples (with rollup retention), device tokens, the project registry, and a **run index** (id, project, name, host, lifecycle, health, times) so the fleet view and `trun ls` never need to open every project file |
+| `projects/<name>.db` | That project's runs, steps, events, logs (FTS5 trigram index), metrics, alerts, notes, artifact index, and a **copy of the host samples for each run's time window**, taken when the run ends |
+
+Each project file is **self-contained**. Copy one file and you have the whole history
+of that project, including host resource graphs, which works as an archive or backup,
+or to move it to another machine. Deleting a project deletes its file.
+
+### What is a project?
+
+A run's project is resolved in this order:
+
+1. `--project <name>` on the command line, or `project = "<name>"` in the task template
+2. `name` in the nearest `.trun/config.toml`, searching up from the run's cwd
+3. the name of the git repository root that contains the cwd (from the `origin` URL, falling back to the directory name)
+4. otherwise `_adhoc`
+
+This makes the same repository on the desktop and on `gpu1` the **same project**,
+because the name comes from config or the git remote, not from a local path. Runs
+from both hosts land in one file.
+
+### SQLite configuration
+
+- Bundled SQLite (`rusqlite` with its own copy built in) with WAL mode, `synchronous=NORMAL`
+  on the hub, `FULL` for the agent spool, and `STRICT` tables.
+- Each file has one writer task that commits in small batches (every ~50 ms or
+  1,000 events, whichever comes first). Readers (the UI, MCP, `trun wait`) run
+  concurrently without blocking it.
+- Log search uses FTS5 with the trigram tokenizer, so substring searches are indexed.
+  Regex search is applied on top of the trigram prefilter.
+- Retention is configured per project (`[retention]` in `.trun/config.toml`) and
+  enforced by background deletes plus `incremental_vacuum`.
+- Project files open lazily and close after they've been idle, so hundreds of
+  projects cost nothing.
+- The agent spool is a single separate SQLite file per agent. It is temporary and
+  pruned once the hub acknowledges events.
 
 ### Run state is two separate axes
 
@@ -100,7 +151,7 @@ and digests show both.
 | Async runtime | tokio | Standard |
 | HTTP / WS | axum + tokio-tungstenite | Standard, and good for SSE/WS |
 | Wire encoding | MessagePack (rmp-serde) | Compact, schema shared through serde types |
-| Storage | SQLite (rusqlite, WAL mode) | Hub history and agent spool alike, with zero ops |
+| Storage | SQLite (bundled rusqlite, WAL, FTS5), one file per project plus `hub.db` | Embedded, crash-safe, static builds, fast range reads and appends. Each project file is portable (D20) |
 | Check/parser scripting | Starlark (starlark-rust) | Python dialect AI writes best, hermetic by design, compiler-grade error messages, fastest embedded engine benchmarked (see D19) |
 | System stats | sysinfo | Cross-platform |
 | GPU stats | nvml-wrapper (NVIDIA); ROCm SMI later | |

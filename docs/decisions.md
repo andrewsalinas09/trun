@@ -201,3 +201,20 @@ Starlark as host functions.
 design. At an extreme 100k lines/s, parsing costs about 5% of one core. A compiled
 WASM plugin tier for heavy custom parsers remains possible later, but is out of scope
 for v1.
+
+## D20 · SQLite confirmed; one database file per project (2026-09-28)
+
+**Context:** Alternatives were reviewed against trun's workload: append-heavy writes,
+range reads by run and time, one writer per database, embedded, static cross-platform
+builds, and crash safety. DuckDB is weak at small streaming appends, a heavy C++
+dependency, and its analytics strength is mostly redundant because of agent-side
+downsampling. redb and fjall are key-value stores only, so every index would be
+hand-built. Turso/Limbo is less proven. Time-series databases are servers.
+**Decision:** SQLite stays (confirms D13). Storage is split into a small global
+`hub.db` (hosts, samples, project registry, run index) and **one self-contained
+SQLite file per project** holding its runs, events, logs, metrics, alerts, notes,
+and per-run host samples. The project is resolved from `--project`, then
+`.trun/config.toml`, then the git remote or root name, falling back to `_adhoc`.
+**Consequences:** A project's history is portable as one file, and retention and
+deletion are per project. Cross-project views go through the run index in `hub.db`.
+DuckDB can still read the files as an optional, external analysis tool.

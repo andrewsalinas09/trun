@@ -8,7 +8,7 @@ things, what "healthy" means, and how to view them.
 ```
 my-project/
   .trun/
-    config.toml            # project defaults
+    config.toml            # project defaults; `name = "detector"` sets the project identity
     tasks/                 # task templates:  trun run <name>
       train.toml
       test.toml
@@ -74,7 +74,7 @@ lr     = { default = "3e-4", flag = "--lr" }
   checks/defaults.star
   panels/            # global panels usable from any run
   dashboards/
-  data/              # hub SQLite + artifacts (hub role)
+  data/              # hub role: hub.db + projects/<name>.db + artifacts/ (see 02-architecture.md)
   spool/             # agent spool (agent role)
 ```
 
