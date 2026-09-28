@@ -1,0 +1,15 @@
+[package]
+name = "trun-store"
+description = "SQLite storage for trun: hub.db index plus one database file per project"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+trun-proto.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+regex.workspace = true
+tracing.workspace = true
+tokio.workspace = true

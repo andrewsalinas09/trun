@@ -15,6 +15,16 @@ problem: invisible, silently failing runs.
 succeeds are all visible in the browser with correct states. Closing the launching
 terminal doesn't kill a detached run. Windows and Linux both work.
 
+**Status: done (2026-09-28).** Verified on Windows 11 and on Linux (a static musl
+build in WSL): success, import-error crash, missing program, SIGSEGV, SIGKILL, a
+hang plus cancel of the whole process tree, and a detached run and hub surviving the
+launching shell. Known gaps carried forward:
+- Windows cancel is a hard kill of the Job Object. Graceful Ctrl-Break needs a
+  shared console, so it is deferred.
+- Runs are owned by the hub process. If the hub dies, active runs are marked `lost`
+  on restart (reconnection to still-running processes is planned with M4's agent).
+- `--pty` moved to M2 as planned. stdin is always null.
+
 ## M2 · Structure: protocol, parsers, panels
 
 - `::` protocol (steps, progress, metrics, notes, heartbeat, expect), `trun emit`

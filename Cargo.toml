@@ -1,0 +1,49 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/andrewsalinas09/trun"
+
+[workspace.dependencies]
+trun-proto = { path = "crates/trun-proto" }
+trun-store = { path = "crates/trun-store" }
+trun-supervise = { path = "crates/trun-supervise" }
+trun-parse = { path = "crates/trun-parse" }
+trun-agent = { path = "crates/trun-agent" }
+trun-hub = { path = "crates/trun-hub" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+ulid = "1"
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+dirs = "6"
+rust-embed = "8"
+mime_guess = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.9"
+libc = "0.2"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_Security",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

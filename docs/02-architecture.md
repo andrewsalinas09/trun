@@ -35,10 +35,11 @@ just runs `trun hub`, which includes a local agent.
 - **Single user, self-hosted.** Remote hosts connect over the user's SSH (the hub
   dials in) or a tailnet (the agent dials out). Nothing is exposed publicly. See
   [07 Remote](07-remote.md).
-- **Local IPC.** `trun run` and other CLI commands talk to the local daemon over a
-  Unix domain socket (Linux/macOS) or a named pipe (Windows).
-- **If no daemon is running,** `trun run` starts an ephemeral agent in the
-  background, so the command always works.
+- **Local clients.** The CLI, the web UI, and `trun mcp` all use the hub's HTTP API on
+  `127.0.0.1:7317`, authenticated with the per-user token in `~/.trun/hub.token`
+  (D21).
+- **If no hub is running,** `trun run` starts one in the background (detached from
+  the terminal and from the caller's job object), so the command always works.
 
 ## Data flow for one run
 

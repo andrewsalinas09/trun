@@ -1,0 +1,20 @@
+[package]
+name = "trun-agent"
+description = "The trun agent: owns runs on one host, sequences their events, feeds the store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+trun-proto.workspace = true
+trun-store.workspace = true
+trun-supervise.workspace = true
+trun-parse.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+ulid.workspace = true
+serde.workspace = true
+toml = "0.9"
+gethostname = "1"
+dirs.workspace = true

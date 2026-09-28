@@ -216,5 +216,21 @@ SQLite file per project** holding its runs, events, logs, metrics, alerts, notes
 and per-run host samples. The project is resolved from `--project`, then
 `.trun/config.toml`, then the git remote or root name, falling back to `_adhoc`.
 **Consequences:** A project's history is portable as one file, and retention and
-deletion are per project. Cross-project views go through the run index in `hub.db`.
+deletion are per project.
+
+## D21 · Local clients talk to the hub over loopback HTTP with a token (2026-09-28)
+
+**Context:** docs/02 originally planned a Unix socket or named pipe for CLI↔daemon
+IPC. The browser UI, MCP, and the CLI all need the same API, and named pipes need a
+separate transport on Windows.
+**Decision:** One transport: HTTP on `127.0.0.1:7317`. Every `/api` call requires
+the per-user token in `~/.trun/hub.token` (mode 0600), sent as a bearer header or as
+an HttpOnly SameSite=Strict cookie set by the `/?t=<token>` handshake that `trun ui`
+opens. Requests whose `Host` isn't loopback are rejected, which defends against DNS
+rebinding.
+**Consequences:** One code path for all clients. Other local users can't use the
+API without the token. The CLI auto-starts the hub as a detached process (setsid on
+Unix; on Windows DETACHED_PROCESS plus breakaway from the caller's job, so a harness
+killing its job doesn't take the hub with it).
+ Cross-project views go through the run index in `hub.db`.
 DuckDB can still read the files as an optional, external analysis tool.

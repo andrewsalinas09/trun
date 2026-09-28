@@ -1,0 +1,32 @@
+[package]
+name = "trun"
+description = "Live visibility into long-running tasks, shared by humans and AI agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "trun"
+path = "src/main.rs"
+
+[dependencies]
+trun-proto.workspace = true
+trun-hub.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+open = "5"
+bytes = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

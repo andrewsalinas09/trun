@@ -63,4 +63,37 @@ trun wait train-v3 --until done,failed,stalled
 
 ## Status
 
-Design phase. No code yet.
+**M1 is implemented** (local supervisor, hub, SQLite store, and web UI) on Windows
+and Linux. See the [roadmap](docs/10-roadmap.md). Remote hosts, `trun wait`, checks,
+and MCP come in later milestones. The examples above that use them describe the
+design.
+
+What works today:
+
+```sh
+trun run -- python train.py          # attached: streams output, exits with the run's code
+trun run -d --name nightly -- make   # detached: prints the run id, keeps running
+trun ls [-a]                         # runs, newest first (-a: active only)
+trun status nightly                  # digest: state, diagnosis, last output
+trun logs -f nightly [--grep re]     # output, then follow live
+trun cancel nightly [--force]        # stop the whole process tree
+trun ui [run]                        # open the web UI
+trun hub start|stop|status           # the hub auto-starts on first use
+```
+
+## Development
+
+```sh
+cd ui && npm install && npm run build   # the UI is embedded into the binary from ui/dist
+cd .. && cargo build                    # without a built UI, a placeholder page is embedded
+cargo test
+```
+
+- `TRUN_HOME` relocates all state (default `~/.trun`), which is useful for isolated
+  test runs.
+- `TRUN_LOG=debug` raises hub log verbosity. The auto-started hub logs to
+  `~/.trun/hub.log`.
+- Static Linux builds: `cargo zigbuild --release -p trun --target x86_64-unknown-linux-musl`
+  (or `aarch64-unknown-linux-musl`).
+- On Windows, stop the hub (`trun hub stop`) before rebuilding, because a running
+  `trun.exe` can't be overwritten.

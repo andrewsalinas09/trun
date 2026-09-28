@@ -1,0 +1,18 @@
+[package]
+name = "trun-supervise"
+description = "Process supervision for trun: spawn, capture output, kill process trees"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+trun-proto.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+which = "8"
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
