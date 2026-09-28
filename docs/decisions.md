@@ -169,3 +169,35 @@ published to crates.io, the package gets a different name (for example `trun-cli
 and the binary stays `trun`.
 **Consequences:** Installation is from GitHub releases or `cargo install --git`, which
 is fine for a self-hosted single-user tool.
+
+## D19 · Starlark for checks and parsers; plain Rust for everything built in (2026-09-28)
+
+**Context:** D6 tentatively chose Rhai. The candidates were benchmarked on the same
+workload: a regex parser over 100k synthetic log lines, and a check calling host
+series functions. Windows release builds:
+
+| Engine | Parse (ns/line) | Check (µs/eval) | Load (µs) |
+|---|---|---|---|
+| Plain Rust (ceiling) | 267 | 4.7 | – |
+| **Starlark (starlark-rust 0.14)** | **472** | **5.3** | 771 |
+| Lua 5.4 (mlua 0.12), Lua patterns | 1228 | 8.0 | 34 |
+| Luau (mlua 0.12), Lua patterns | 1364 | 7.2 | 123 |
+| QuickJS-NG (rquickjs 0.14) | 1358 | 7.6 | 83 |
+| Rhai 1.26 | 2026 | 10.5 | 280 |
+
+All of these build as static musl binaries for x86_64 and aarch64 (verified with
+cargo-zigbuild). In the error tests, Rhai tripped on the reserved word `match`, which
+is a common AI-authored name. Starlark gave the clearest, rustc-style diagnostics.
+
+**Decision:** Starlark (starlark-rust) for user-authored checks and parsers. It
+supersedes D6. Plain Rust (compiled user code, or WASM) was considered and rejected
+for user files. It is only about 0.2 µs per line faster, and it would need a compile
+step (5–30 s instead of about 1 ms), a toolchain or WASM runtime on every host, and a
+separate sandbox. That breaks the edit→live loop (D5). Everything heavy stays native
+Rust: built-in parsers, diagnosis, regex, series math, and percentiles, exposed to
+Starlark as host functions.
+
+**Consequences:** Python syntax, the language AI writes most reliably. Hermetic by
+design. At an extreme 100k lines/s, parsing costs about 5% of one core. A compiled
+WASM plugin tier for heavy custom parsers remains possible later, but is out of scope
+for v1.

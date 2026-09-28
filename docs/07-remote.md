@@ -213,6 +213,6 @@ idle_shutdown_after = "30m"   # no active runs on this host for 30 min → power
 | Hub ↔ agent | SSH mode: your SSH keys. Join mode: TLS or WireGuard plus a per-agent credential, revocable from the hub |
 | Remote exec | SSH mode: on (equivalent to SSH access). Join mode: off unless enabled per agent. Optional command allowlist in both |
 | Host shutdown | Off unless `allow_shutdown = true` on that agent |
-| Scripts (checks, parsers) | Rhai sandbox, no I/O |
+| Scripts (checks, parsers) | Starlark: hermetic by design (no I/O primitives exist), cancellation budget |
 | TS panels | Sandboxed iframe, no network |
 | Secrets in output | A redaction filter (configurable regexes, plus common token formats) runs on the agent **before** spooling or sending |

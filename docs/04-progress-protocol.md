@@ -111,27 +111,29 @@ turned off per task.
 The diagnosis parser always runs. Its output feeds the run's final `diagnosis` field,
 so "why did it fail?" has a one-line answer.
 
-## Custom parsers (Rhai)
+## Custom parsers (Starlark)
 
-`.trun/parsers/*.rhai` files are loaded and hot-reloaded. A parser declares which runs
-it applies to and a function per line:
+`.trun/parsers/*.star` files are loaded and hot-reloaded. A parser declares which runs
+it applies to and defines a function called on each line:
 
-```rust
-// .trun/parsers/my-sim.rhai
-fn meta() {
-    #{ applies: "sim-*", priority: 10 }
-}
+```python
+# .trun/parsers/my-sim.star
+META = {"applies": "sim-*", "priority": 10}
 
-// Called for each output line. Return () for no events, or an event map / array of maps.
-fn parse(line, stream) {
-    let m = line.match(`^t=(\d+) energy=([-\d.e]+) residual=([-\d.e]+)`);
-    if m != () {
-        return #{ kind: "metric", step: m[1].parse_int(),
-                  values: #{ energy: m[2].parse_float(), residual: m[3].parse_float() } };
-    }
-}
+SIM = regex(r"^t=(\d+) energy=([-\d.e]+) residual=([-\d.e]+)")  # compiled once, native Rust regex
+
+# Called for each output line. Return None for no events, or an event dict / list of dicts.
+def parse(line, stream):
+    m = SIM.match(line)
+    if m:
+        return {
+            "kind": "metric",
+            "step": int(m[1]),
+            "values": {"energy": float(m[2]), "residual": float(m[3])},
+        }
 ```
 
-Parsers must be fast. A per-line time budget applies (default 200 µs), and a parser
+Regexes are compiled once at load time by the host (the Rust `regex` crate), so
+per-line matching runs at native speed. Parsers must be fast. A per-line time budget applies (default 200 µs), and a parser
 that repeatedly exceeds it is disabled for the run with a `check_error` event. Use
 `trun parse test` to develop against captured logs.

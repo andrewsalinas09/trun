@@ -1,32 +1,31 @@
 # 05 · Checks & stall detection
 
-Checks are small Rhai scripts evaluated continuously **on the agent that owns the
+Checks are small [Starlark](https://github.com/facebook/starlark-rust) scripts,
+a restricted dialect of Python, evaluated continuously **on the agent that owns the
 run**. They keep working when the hub is unreachable, the laptop is asleep, or no one
 is watching. They turn raw state into **health** and **alerts**, and can take actions.
 
+The heavy lifting (series math, regex, percentiles) is native Rust exposed as host
+functions. Starlark is only the thin rule logic, so it is fast (see D19).
+
 ## Anatomy of a check
 
-```rust
-// .trun/checks/training.rhai
-fn meta() {
-    #{
-        applies: "train*",      // glob on run name or template; "*" = all runs
-        every: secs(30),        // evaluation interval (default 10s)
-        grace: mins(2),         // don't evaluate until the run is this old
-    }
+```python
+# .trun/checks/training.star
+META = {
+    "applies": "train*",   # glob on run name or template; "*" = all runs
+    "every": secs(30),     # evaluation interval (default 10s)
+    "grace": mins(2),      # don't evaluate until the run is this old
 }
 
-fn check(run) {
-    if run.metric("loss").last().is_nan() {
-        fail("loss went NaN");
-    }
-    if run.metric("loss").slope(mins(15)) > -0.0001 && run.elapsed() > mins(30) {
-        warn("loss has plateaued for 15 min");
-    }
-    if run.host.gpu.util.avg(mins(5)) < 5.0 {
-        stalled("GPU idle for 5 min (dataloader bottleneck or hang?)");
-    }
-}
+def check(run):
+    loss = run.metric("loss")
+    if is_nan(loss.last()):
+        fail("loss went NaN")
+    if loss.slope(mins(15)) > -0.0001 and run.elapsed() > mins(30):
+        warn("loss has plateaued for 15 min")
+    if run.host.gpu.util.avg(mins(5)) < 5.0:
+        stalled("GPU idle for 5 min (dataloader bottleneck or hang?)")
 ```
 
 One file can hold many rules. Each call to an action function produces an alert
@@ -78,7 +77,7 @@ Checks are evaluated repeatedly, so alerts are **edge-triggered with hysteresis*
 
 ## Default checks
 
-These are shipped in the global config (`~/.trun/checks/defaults.rhai`) and apply to
+These are shipped in the global config (`~/.trun/checks/defaults.star`) and apply to
 every run unless `--no-default-checks` is used or they are overridden.
 
 | Check | Rule | Action |
@@ -120,7 +119,7 @@ It is the first thing a digest shows for a failed run.
 ## Developing checks
 
 ```sh
-trun check test .trun/checks/training.rhai --run train-v3   # replay against recorded data
+trun check test .trun/checks/training.star --run train-v3   # replay against recorded data
 trun lint .trun/checks/
 ```
 
@@ -131,6 +130,26 @@ and to the agent over MCP). They never crash the agent.
 
 ## Sandbox
 
-The Rhai engine runs with operation and memory limits, and with no filesystem,
-network, or process access. The only side effects are the action functions listed
-above.
+Starlark is hermetic by design. The language has no filesystem, network, process,
+clock, or randomness primitives. The only side effects are the host functions trun
+exposes (the actions above). In addition:
+
+- **Termination:** Starlark has no `while` loops or recursion by default, so most
+  scripts terminate by construction. A cancellation budget
+  (`Evaluator::set_check_cancelled`, time-based) guards against pathological
+  `for` loops over huge ranges.
+- **Memory:** each evaluation runs on its own heap, with a size limit.
+- **Errors** come with file, line, column, and a caret-underlined snippet, in the
+  style of rustc diagnostics. They are passed verbatim to the UI and to
+  `get_errors`, so an AI can fix its own check.
+
+## Language notes for authors
+
+- The syntax is Python, but it is a restricted dialect: no `while`, no recursion,
+  no classes, no `import` (use `load()` for shared helpers in `.trun/lib/*.star`),
+  no exceptions, and top-level values are frozen after load.
+- Constants such as `META` and compiled regexes are defined at the top level. They
+  are evaluated once when the file loads.
+- Host helpers: `secs()`, `mins()`, `hours()`, `regex(pattern)` (returns an object
+  with `.match()`, `.search()`, `.findall()`), `is_nan()`, `is_inf()`, and the action
+  functions.

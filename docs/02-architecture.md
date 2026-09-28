@@ -23,7 +23,7 @@ just runs `trun hub`, which includes a local agent.
  │ trun agent                  │ SSH channel │ trun hub                     │
  │  ├─ supervisor(s)           │  or WSS     │  ├─ embedded agent (local)   │
  │  ├─ system + GPU sampler    │ ──────────▶ │  ├─ SQLite history           │
- │  ├─ checks (Rhai)           │ ◀────────── │  ├─ HTTP + WS API            │
+ │  ├─ checks (Starlark)       │ ◀────────── │  ├─ HTTP + WS API            │
  │  ├─ parsers                 │  commands   │  ├─ web UI (static assets)   │
  │  └─ SQLite spool            │             │  └─ file watcher (.trun/)    │
  └─────────────────────────────┘             └───────▲──────────▲───────────┘
@@ -101,7 +101,7 @@ and digests show both.
 | HTTP / WS | axum + tokio-tungstenite | Standard, and good for SSE/WS |
 | Wire encoding | MessagePack (rmp-serde) | Compact, schema shared through serde types |
 | Storage | SQLite (rusqlite, WAL mode) | Hub history and agent spool alike, with zero ops |
-| Check/parser scripting | Rhai | Embeddable, sandboxed, JS-like syntax that AI writes well, runs headless on the agent |
+| Check/parser scripting | Starlark (starlark-rust) | Python dialect AI writes best, hermetic by design, compiler-grade error messages, fastest embedded engine benchmarked (see D19) |
 | System stats | sysinfo | Cross-platform |
 | GPU stats | nvml-wrapper (NVIDIA); ROCm SMI later | |
 | File watching | notify | Hot reload of `.trun/` |
@@ -122,8 +122,8 @@ trun/
     trun-proto/      serde types for events, commands, wire protocol
     trun-store/      SQLite schema + queries (hub + spool)
     trun-supervise/  process spawning, pty, output capture, job objects
-    trun-parse/      :: protocol + built-in parsers + Rhai parser host
-    trun-checks/     Rhai check engine, time-series API, alert state machine
+    trun-parse/      :: protocol + built-in parsers + Starlark parser host
+    trun-checks/     Starlark check engine, time-series API, alert state machine
     trun-agent/      agent daemon, samplers, spool, uplink
     trun-hub/        hub daemon, API, fan-out, command relay
     trun-mcp/        MCP server

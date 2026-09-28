@@ -28,7 +28,7 @@ panel edited in an editor re-renders within 1 s.
 
 ## M3 · Checks, stall detection, wait
 
-- Rhai check engine, time-series API, alert hysteresis, health axis
+- Starlark check engine, time-series API, alert hysteresis, health axis
 - Default checks (silence, no-progress, zombie, NaN, disk, memory)
 - `trun wait` with exit codes and digest output
 - `trun check test` replay

@@ -52,7 +52,7 @@ trun wait train-v3 --until done,failed,stalled
 | [02 Architecture](docs/02-architecture.md) | Components, topology, tech stack, data model |
 | [03 CLI](docs/03-cli.md) | Command reference |
 | [04 Progress protocol](docs/04-progress-protocol.md) | `::` output lines, side channel, built-in and custom parsers |
-| [05 Checks & stall detection](docs/05-checks.md) | Rhai check scripts, the time-series API, actions, defaults |
+| [05 Checks & stall detection](docs/05-checks.md) | Starlark check scripts, the time-series API, actions, defaults |
 | [06 Panels & dashboards](docs/06-panels.md) | TOML panels, TypeScript panels, dashboards, hot reload |
 | [07 Remote & cloud](docs/07-remote.md) | Agents, transport, spool and resume, auth, preemption, cost control |
 | [08 MCP interface](docs/08-mcp.md) | Tools the AI agent uses, digests, the wake-up pattern |

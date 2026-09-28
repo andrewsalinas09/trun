@@ -12,10 +12,10 @@ my-project/
     tasks/                 # task templates:  trun run <name>
       train.toml
       test.toml
-    checks/                # Rhai checks
-      training.rhai
-    parsers/               # Rhai parsers
-      my-sim.rhai
+    checks/                # Starlark checks (.star)
+      training.star
+    parsers/               # Starlark parsers (.star)
+      my-sim.star
     panels/                # TOML / TS panels
       loss.toml
       confusion.ts
@@ -71,7 +71,7 @@ lr     = { default = "3e-4", flag = "--lr" }
 ~/.trun/
   config.toml        # hub/agent/client settings, default check thresholds
   agent.toml         # agent credential + permissions (allow_exec, allow_shutdown, cost)
-  checks/defaults.rhai
+  checks/defaults.star
   panels/            # global panels usable from any run
   dashboards/
   data/              # hub SQLite + artifacts (hub role)
