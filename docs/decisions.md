@@ -276,3 +276,31 @@ explains when a hub from another `TRUN_HOME` holds the port. A `hub stop` gives 
 SSE connections 2 s, then exits.
 **Consequences:** trun is safe to call from any capturing context, which is the
 normal case for AI agents.
+
+## D25 · Float fields survive serde_json `arbitrary_precision` (2026-09-29)
+
+**Context:** starlark enables serde_json's `arbitrary_precision`, and Cargo unifies
+features across the build. Under it, floats in buffered serde paths (internally
+tagged enums, `flatten`, untagged) arrive as a private map. `Progress` events,
+progress directives, and `FleetEvent`-wrapped step state failed to decode with
+"invalid type: map, expected f64". The hub couldn't read back summaries it had
+stored.
+**Decision:** `Num` has an explicit visitor that also accepts the map form. Every
+`f64`/`Option<f64>` field in trun-proto uses `flex::f64`/`flex::opt_f64`. A
+regression test lives in trun-checks, so it always builds with the feature on.
+**Consequences:** New float fields in proto types must use `flex` (or `Num`).
+Integers are unaffected.
+
+## D26 · Check API: flat run methods, seconds everywhere, `None` for no data (2026-09-29)
+
+**Context:** The first sketch used nested objects (`run.host.gpu.util`) and mixed
+units. AI-written checks do best with a small, uniform surface.
+**Decision:** Flat methods on `run` (`silence()`, `proc_cpu()`, `metric()`,
+`steps()`, …) returning series. All durations are seconds (`mins(15)` = 900).
+Aggregations over no data return `None`, and `is_nan(None)` is `False`. The
+built-in defaults are written in Starlark with the same API and embedded in the
+binary. `RunData` is built from the stored events, so `trun check test` replays
+exactly what the live check saw.
+**Consequences:** Checks must guard `!= None` before comparing aggregates (the docs'
+examples do). Sampled series (process, host, GPU) are live-only until samples are
+recorded (M4).

@@ -15,6 +15,7 @@ trun-supervise = { path = "crates/trun-supervise" }
 trun-parse = { path = "crates/trun-parse" }
 trun-agent = { path = "crates/trun-agent" }
 trun-hub = { path = "crates/trun-hub" }
+trun-checks = { path = "crates/trun-checks" }
 
 anyhow = "1"
 thiserror = "2"

@@ -22,35 +22,79 @@ def check(run):
     loss = run.metric("loss")
     if is_nan(loss.last()):
         fail("loss went NaN")
-    if loss.slope(mins(15)) > -0.0001 and run.elapsed() > mins(30):
+    trend = loss.slope(mins(15))            # None until there are 2+ points
+    if trend != None and trend > -0.0001 and run.elapsed() > mins(30):
         warn("loss has plateaued for 15 min")
-    if run.host.gpu.util.avg(mins(5)) < 5.0:
+    gpu = run.gpu_util().avg(mins(5))       # None when there is no GPU data
+    if gpu != None and gpu < 5.0:
         stalled("GPU idle for 5 min (dataloader bottleneck or hang?)")
 ```
 
-One file can hold many rules. Each call to an action function produces an alert
-keyed by `(check file, message template)`.
+Try it against a finished run without waiting for a live failure:
+`trun check test .trun/checks/training.star --run train-v3`.
 
-## The time-series API
+One file can hold many rules. Each action call produces an alert identified by the
+check name plus the message with its numbers normalized ("no output for 5m03s" and
+"no output for 5m13s" are the same alert). An explicit `key="…"` argument overrides
+this.
 
-Everything numeric is a **series**, a sequence of timestamped values.
+## The check API (implemented in M3)
 
-| Source | Expression |
+**Units: durations are seconds everywhere.** `mins(15)` is `900`. `run.elapsed()`,
+`run.silence()` and `series.age()` return seconds. `slope()` and `rate()` are per
+second. Aggregations over a window with no data return `None` instead of raising, so
+test with `!= None` (or `is_nan()`, which is `False` for `None`).
+
+### The run
+
+| Expression | Returns |
 |---|---|
-| Run metrics | `run.metric("loss")` |
-| Step progress | `run.progress("train")` (series of `current`), `run.progress("train").rate(mins(5))` |
-| Output activity | `run.output.silence()` (duration since last output line or heartbeat), `run.output.lines_per_min()` |
-| Log matches | `run.logs.count(`(?i)error`, mins(10))` |
-| Run process | `run.proc.cpu`, `run.proc.mem`, `run.proc.threads`, `run.proc.io_read`, `run.proc.io_write` |
-| Host | `run.host.cpu`, `run.host.mem`, `run.host.disk_free("/data")`, `run.host.gpu.util`, `.gpu.mem`, `.gpu.temp`, `.gpu.power` (all GPUs used by the run; `run.host.gpu[i]` for one) |
-| Run facts | `run.elapsed()`, `run.name`, `run.tags`, `run.lifecycle`, `run.step_current()` |
+| `run.id`, `run.name`, `run.project` | strings |
+| `run.lifecycle` | `queued`, `starting`, `running`, `succeeded`, `failed`, `cancelled`, `lost`, `preempted` |
+| `run.elapsed()` | seconds since the run started |
+| `run.silence()` | seconds since the last output line, heartbeat, or structured event (`None` before start) |
+| `run.expect_silence()` | seconds set by `::expect silence=…`, or `None` |
+| `run.lines_per_min(window=60)` | output rate |
+| `run.metric(name)` | a **series**. It is empty if the run never reported that metric |
+| `run.metrics()` | sorted metric names |
+| `run.progress(id=None)` | series of a step's `current`, recorded when it changes. Without an id: the latest running step with progress |
+| `run.steps()` | list of dicts: `id`, `name`, `parent`, `running`, `current`, `total`, `unit`, `age` |
+| `run.proc_cpu()`, `run.proc_mem()` | CPU % (100 = one core) and resident bytes of the run's **whole process tree** |
+| `run.host_cpu()`, `run.host_mem()` | host CPU %, and memory used % |
+| `run.disk_free()` | free bytes on the volume holding the working directory |
+| `run.gpu_util()`, `run.gpu_mem()` | GPU series. Empty until GPU sampling lands (M4) |
+| `run.config(key, default)` | a threshold from `[defaults.checks]` in config.toml (durations as seconds) |
 
-Series methods: `last()`, `avg(d)`, `min(d)`, `max(d)`, `slope(d)` (per second, by
-least squares), `delta(d)`, `rate(d)`, `count(d)`, `stddev(d)`, `is_nan()`,
-`age()` (time since last point), `exists()`.
+Resources are sampled every 5 s by the agent.
 
-Durations: `secs(n)`, `mins(n)`, `hours(n)`. They compare against each other and
-against `run.elapsed()`.
+### Series methods
+
+`last()` · `avg(window=None)` · `min(window)` · `max(window)` · `stddev(window)` ·
+`slope(window)` (least squares, per second) · `delta(window)` · `rate(window)` ·
+`count(window)` · `count_non_finite(window)` · `age()` (seconds since the latest
+point) · `exists()`
+
+`window` is in seconds. Without one, the whole retained history is used (series keep
+2 h, capped at 200k points). `last()` can be NaN: detecting that is the point.
+
+### Globals
+
+`secs(n)`, `mins(n)`, `hours(n)` · `is_nan(x)`, `is_inf(x)`, `is_finite(x)` (all
+`False` for `None`) · `fmt_duration(seconds)` → `"4m12s"`
+
+### META
+
+```python
+META = {
+    "applies": "train*",   # glob on the run name (default: every run)
+    "every": secs(30),     # evaluation interval, default 10 s, minimum 1 s
+    "grace": mins(2),      # skip until the run is this old
+    "kill": True,          # fail() also stops the run
+    "clear_after": 3,      # quiet evaluations before an alert clears
+}
+```
+
+Unknown META keys are errors, so a typo like `evry` is caught.
 
 ## Actions
 
@@ -60,9 +104,9 @@ against `run.elapsed()`.
 | `warn(msg)` | Health becomes at least `warn` |
 | `stalled(msg)` | Health becomes `stalled`. Wakes `trun wait --until stalled` |
 | `fail(msg)` | Health becomes `failing`. With `kill: true` in meta, it also cancels the run |
-| `kill(msg)` | Cancels the run immediately and records the reason |
-| `notify(msg)` | Desktop/phone notification regardless of level |
-| `shutdown_host(msg)` | Powers off the host. **Only when the agent config sets `allow_shutdown = true`.** Meant for costly cloud boxes |
+| `kill(msg)` | Stops the run (graceful, then forced). It ends `failed` with diagnosis `killed-by-check` |
+| `notify(msg)` | Desktop notification regardless of level (no alert) |
+| `shutdown_host(msg)` | *(planned, M7)* Powers off the host. **Only when the agent config sets `allow_shutdown = true`.** Meant for costly cloud boxes |
 
 ## Alert lifecycle and hysteresis
 
@@ -77,23 +121,39 @@ Checks are evaluated repeatedly, so alerts are **edge-triggered with hysteresis*
 
 ## Default checks
 
-These are shipped in the global config (`~/.trun/checks/defaults.star`) and apply to
-every run unless `--no-default-checks` is used or they are overridden.
+They are built into the binary
+([`crates/trun-checks/src/defaults.star`](../crates/trun-checks/src/defaults.star),
+Starlark using the same API) and apply to every run unless `--no-default-checks` is
+used. A `checks/defaults.star` in the project's `.trun/` or in `$TRUN_HOME` replaces
+them. `trun check lint` lists what is active.
 
 | Check | Rule | Action |
 |---|---|---|
 | Silence | No output or heartbeat for 5 min (respects `::expect silence=`) | `stalled` |
 | No progress | A progress-tracked step hasn't advanced in 15 min | `stalled` |
-| Zombie | Process alive, CPU < 1%, no GPU activity, no output, for 10 min | `stalled` |
+| Zombie | Process tree alive, CPU < 1% (sampled), no GPU activity, no output, for 10 min | `stalled` |
 | Early death | Exited non-zero within 60 s of start | diagnosis highlighted as "failed to start" |
-| NaN / Inf | Any metric's last value is NaN or Inf | `fail` |
+| NaN / Inf | Any metric had a NaN/Inf value in the last 5 min | `fail` (clears 5 min after the last bad value) |
 | Disk | Free space on the cwd volume < 2 GB | `warn`; < 200 MB → `fail` |
 | Memory | Host memory > 95% for 2 min | `warn` (OOM likely) |
-| GPU idle | Run uses a GPU and utilization < 5% for 10 min | `stalled` |
-| GPU thermal | GPU temp > 88 °C for 5 min | `warn` |
+| GPU idle | Run uses a GPU and utilization < 5% for 10 min | `stalled` (active once GPU sampling exists, M4) |
+| GPU thermal | GPU temp > 88 °C for 5 min | `warn` (planned, M4) |
 
-Default thresholds can be changed in `~/.trun/config.toml` under `[defaults.checks]`
-without editing the script.
+Thresholds can be changed in `$TRUN_HOME/config.toml` without editing the script
+(durations as `"90s"`/`"5m"`, or numbers):
+
+```toml
+[defaults.checks]
+silence = "5m"          # no output/heartbeat/events
+no_progress = "15m"     # a progress-reporting step stopped moving
+zombie = "10m"          # idle, silent process tree
+nan_window = "5m"       # how long a NaN keeps the run failing
+disk_warn_bytes = 2e9
+disk_fail_bytes = 200e6
+memory_pct = 95
+memory_window = "2m"
+gpu_idle = "10m"
+```
 
 ## Hub-side checks
 
@@ -119,14 +179,43 @@ It is the first thing a digest shows for a failed run.
 ## Developing checks
 
 ```sh
-trun check test .trun/checks/training.star --run train-v3   # replay against recorded data
-trun lint .trun/checks/
+trun check lint                                   # this project's + global checks + builtins
+trun check lint .trun/checks/training.star        # specific files
+trun check test .trun/checks/training.star --run train-v3 [--with-defaults]
+trun check test builtin:defaults --run train-v3   # how the defaults saw that run
 ```
 
-A replay evaluates the check on each tick of the recorded run and prints when each
-alert would have opened and cleared. That makes it quick to tune thresholds.
-Runtime errors in a check become `check_error` events on the run (visible in the UI
-and to the agent over MCP). They never crash the agent.
+A replay feeds the recorded events into the same `RunData` the live agent uses, and
+evaluates the check on its own schedule from start to end. It prints when each alert
+would have opened, been updated, or cleared:
+
+```
+replaying defaults against run 01M3P… "m3-hang" (22.7s, 5 events, every 5s)
+    +10.0s  opened   [stalled] no output for 10s (limit 8s)
+summary: 5 evaluations · 1 alert(s) opened · 1 open at the end · health stalled
+```
+
+Process, host, and GPU samples are not recorded yet, so those series are empty in
+replays.
+
+**Where checks come from**, by file stem with the first match winning:
+1. `--check FILE` on `trun run`
+2. the project's `.trun/checks/*.star`
+3. `$TRUN_HOME/checks/*.star`
+4. the built-in defaults
+
+Files are re-scanned every 3 s. A broken edit reports a `check_error` and keeps the
+previous version running. Deleting a file clears its alerts.
+
+Runtime errors in a check become `check_error` events on the run, shown once per
+distinct error in the UI's messages and available over MCP. They never crash the
+agent or affect the run.
+
+**Notifications**: when an alert opens or escalates to `stalled` or `fail`, on
+`notify()`, when a run fails, and when a run succeeds after 5+ minutes, the hub
+sends a native desktop notification (Windows toast, freedesktop on Linux, macOS
+Notification Center). Identical notifications within 30 s are dropped. Turn them off
+with `[notify] desktop = false`.
 
 ## Sandbox
 

@@ -19,6 +19,8 @@ serde_json.workspace = true
 toml = "0.9"
 gethostname = "1"
 dirs.workspace = true
+trun-checks.workspace = true
+sysinfo = "0.37"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

@@ -2,11 +2,13 @@
   import { AnsiUp } from "ansi_up";
   import { api, subscribe, Unauthorized } from "../lib/api";
   import { ago, clock, command, duration, elapsed } from "../lib/format";
-  import { MetricStore } from "../lib/metrics.svelte";
+  import { MetricStore, type Pt } from "../lib/metrics.svelte";
   import { now } from "../lib/now.svelte";
   import {
     num,
     TERMINAL,
+    LEVEL_RANK,
+    healthOf,
     yNames,
     type LogLine,
     type PanelSet,
@@ -20,6 +22,7 @@
   import Messages, { type Message } from "./Messages.svelte";
   import Panel from "./Panel.svelte";
   import StateBadge from "./StateBadge.svelte";
+  import Alerts from "./Alerts.svelte";
   import Steps from "./Steps.svelte";
 
   let { id }: { id: string } = $props();
@@ -35,7 +38,8 @@
   let error = $state<string | null>(null);
   let unauthorized = $state(false);
   let cancelling = $state(false);
-  let metrics = $state<MetricStore | null>(null);
+  let metrics: MetricStore | null = null;
+  let series = $state.raw<Record<string, Pt[]>>({});
 
   const ansi = new AnsiUp();
   ansi.use_classes = false;
@@ -73,6 +77,35 @@
   function addMessage(ev: RunEvent) {
     if (ev.kind === "note") messages.push({ seq: ev.seq, ts: ev.ts, level: "note", text: ev.text });
     else if (ev.kind === "log") messages.push({ seq: ev.seq, ts: ev.ts, level: ev.level, text: ev.text });
+    else if (ev.kind === "check_error")
+      messages.push({ seq: ev.seq, ts: ev.ts, level: "error", text: `check ${ev.check}: ${ev.error.split("\n").slice(0, 3).join(" · ")}` });
+    else if (ev.kind === "alert") {
+      const level = ev.level === "fail" ? "error" : ev.level === "info" ? "info" : "warn";
+      messages.push({ seq: ev.seq, ts: ev.ts, level, text: `${ev.state} [${ev.level}] ${ev.message}` });
+    }
+  }
+
+  function onAlert(ev: Extract<RunEvent, { kind: "alert" }>) {
+    if (!run) return;
+    const rest = run.alerts.filter((a) => a.key !== ev.key);
+    if (ev.state === "cleared") {
+      run.alerts = rest;
+    } else {
+      const prev = run.alerts.find((a) => a.key === ev.key);
+      run.alerts = [
+        ...rest,
+        {
+          key: ev.key,
+          check: ev.check,
+          level: ev.level,
+          message: ev.message,
+          opened_at: prev?.opened_at ?? ev.ts,
+          last_at: ev.ts,
+          count: (prev?.count ?? 0) + 1,
+        },
+      ].sort((a, b) => LEVEL_RANK[b.level] - LEVEL_RANK[a.level]);
+    }
+    run.health = healthOf(run.alerts);
   }
 
   function onEvent(ev: RunEvent) {
@@ -151,6 +184,11 @@
       }
       case "log":
       case "note":
+      case "check_error":
+        addMessage(ev);
+        break;
+      case "alert":
+        onAlert(ev);
         addMessage(ev);
         break;
     }
@@ -170,7 +208,7 @@
         for (const m of msgs) addMessage(m);
         for (const l of page.lines as LogLine[]) append(toView(l));
         hasEarlier = page.lines.length >= INITIAL_TAIL;
-        store = new MetricStore(r.id);
+        store = new MetricStore(r.id, (s) => (series = s));
         metrics = store;
         const since = Math.max(page.lines.length ? page.lines[page.lines.length - 1].seq : 0, msgs.length ? msgs[msgs.length - 1].seq : 0);
         close = subscribe(`/runs/${r.id}/events?since_seq=${since}`, {
@@ -223,8 +261,10 @@
 
   const active = $derived(run != null && !TERMINAL.has(run.lifecycle));
   const el = $derived(run ? elapsed(run, now.value) : null);
-  const series = $derived(metrics?.series ?? {});
   const dashboard = $derived(panelSet?.dashboards.find((d) => d.name === panelSet?.dashboard && d.spec) ?? null);
+  const dashboardHasAlerts = $derived(
+    !!dashboard?.spec?.row.some((r) => r.panels.some((c) => c.panel === "builtin:alerts")),
+  );
   const panelsByName = $derived(Object.fromEntries((panelSet?.panels ?? []).map((p) => [p.name, p])));
   const plottedNames = $derived(
     (panelSet?.panels ?? []).flatMap((p) => (p.spec ? yNames(p.spec) : [])),
@@ -271,6 +311,7 @@
   {:else if name === "builtin:metrics"}{@render metricsSection(plottedNames)}
   {:else if name === "builtin:log"}{@render logSection()}
   {:else if name === "builtin:diagnosis"}{@render diagnosisSection()}
+  {:else if name === "builtin:alerts"}<Alerts alerts={run?.alerts ?? []} />
   {/if}
 {/snippet}
 
@@ -313,6 +354,7 @@
   </section>
 
   {#if error}<p class="error">{error}</p>{/if}
+  {#if !dashboardHasAlerts}<Alerts alerts={run.alerts ?? []} />{/if}
 
   {#if dashboard?.spec}
     {#if dashboard.error}<p class="error">dashboard {dashboard.name}: {dashboard.error}</p>{/if}

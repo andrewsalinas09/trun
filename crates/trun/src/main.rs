@@ -1,10 +1,13 @@
 //! `trun` — run, watch, and inspect long-running commands (docs/03-cli.md).
 
+mod checkcmd;
 mod client;
 mod daemon;
+mod digest;
 mod emit;
 mod fmt;
 mod printer;
+mod wait;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -48,6 +51,15 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Block until a run ends, stalls, or alerts; print its digest.
+    /// Exit: 0 succeeded, 1 failed/cancelled, 2 stalled, 3 lost/preempted,
+    /// 4 timeout, 5 alert, 6 health failing, 10 trun error.
+    Wait(wait::WaitArgs),
+    /// Develop checks: lint files, or replay one against a recorded run
+    Check {
+        #[command(subcommand)]
+        action: checkcmd::CheckAction,
+    },
     /// List projects
     Projects,
     /// Report structure from inside a run (step-begin, step-end, progress, metric,
@@ -90,6 +102,12 @@ struct RunArgs {
     /// Run under a pseudo-terminal (programs see a TTY; stdout and stderr merge)
     #[arg(long)]
     pty: bool,
+    /// Extra check file(s) for this run (repeatable)
+    #[arg(long = "check", value_name = "FILE.star")]
+    checks: Vec<std::path::PathBuf>,
+    /// Don't apply the built-in default checks (silence, no-progress, NaN, …)
+    #[arg(long)]
+    no_default_checks: bool,
     /// The command to run (after --)
     #[arg(last = true, required = true, num_args = 1..)]
     command: Vec<String>,
@@ -172,6 +190,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
         Cmd::Run(args) => run(&paths, args).await,
         Cmd::Ls(args) => ls(&paths, args).await,
         Cmd::Status { run } => status(&paths, &run).await,
+        Cmd::Wait(args) => wait::wait(&paths, args).await,
+        Cmd::Check { action } => checkcmd::run(&paths, action).await,
         Cmd::Logs(args) => logs(&paths, args).await,
         Cmd::Cancel { run, force } => {
             let c = Client::connect(&paths, false).await?;
@@ -219,7 +239,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
     }
 }
 
-fn enc(s: &str) -> String {
+pub(crate) fn enc(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
@@ -317,6 +337,15 @@ async fn run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let checks = args
+        .checks
+        .iter()
+        .map(|p| {
+            std::fs::canonicalize(p)
+                .map(|p| strip_verbatim(&p))
+                .with_context(|| format!("check file {}", p.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let c = Client::connect(paths, true).await?;
     let req = CreateRun {
         cmd: args.command,
@@ -325,6 +354,8 @@ async fn run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         project: args.project,
         env,
         pty: args.pty,
+        no_default_checks: args.no_default_checks,
+        checks,
     };
     let r: RunSummary = c.post("/runs", &req).await?;
 
@@ -495,78 +526,7 @@ async fn status(paths: &Paths, reference: &str) -> Result<ExitCode> {
     let c = Client::connect(paths, false).await?;
     let r: RunSummary = c.get(&format!("/runs/{}", enc(reference))).await?;
     let page: LogPage = c.get(&format!("/runs/{}/logs?tail=10", r.id)).await?;
-    let now = now_ms();
-    println!(
-        "run {} \"{}\" · project {} · host {}",
-        r.id, r.name, r.project, r.host
-    );
-    let took = r
-        .elapsed_ms(now)
-        .map(|d| format!(" · {}", fmt::duration(d)))
-        .unwrap_or_default();
-    println!(
-        "state: {} {}{} · health {}",
-        fmt::symbol(r.lifecycle),
-        fmt::state(&r),
-        took,
-        r.health.as_str()
-    );
-    println!("cmd:   {}", fmt::command(&r.cmd));
-    println!("cwd:   {}", r.cwd);
-    match &r.diagnosis {
-        Some(d) => {
-            println!(
-                "diagnosis: {} — {}{}",
-                d.cause,
-                d.summary,
-                if d.early { " [died early]" } else { "" }
-            );
-            for e in &d.evidence {
-                println!("  [{}] {}", e.seq, fmt::truncate(e.text.trim_end(), 160));
-            }
-        }
-        None => println!("diagnosis: –"),
-    }
-    if !r.steps.is_empty() {
-        println!("steps:");
-        for line in fmt::step_tree(&r.steps, now) {
-            println!("  {line}");
-        }
-    }
-    if !r.metrics.is_empty() {
-        println!("metrics (last):");
-        let width = r
-            .metrics
-            .keys()
-            .map(|k| k.chars().count())
-            .max()
-            .unwrap_or(0)
-            .min(24);
-        for (name, m) in r.metrics.iter().take(20) {
-            let step = m.step.map(|s| format!(" step {s}")).unwrap_or_default();
-            let nf = if m.non_finite > 0 {
-                format!(" · {} non-finite!", m.non_finite)
-            } else {
-                String::new()
-            };
-            println!(
-                "  {:<width$}  {:>12}{step} · {}{nf}",
-                fmt::truncate(name, 24),
-                fmt::num(m.value.0),
-                fmt::ago(m.ts)
-            );
-        }
-        if r.metrics.len() > 20 {
-            println!("  … {} more", r.metrics.len() - 20);
-        }
-    }
-    match r.last_output_at {
-        Some(t) => println!("last output {} (seq {}):", fmt::ago(t), r.last_seq),
-        None => println!("no output yet"),
-    }
-    for l in page.lines {
-        println!("  [{}] {}", l.seq, fmt::truncate(l.text.trim_end(), 200));
-    }
+    print!("{}", digest::render(&r, &page.lines, now_ms()));
     Ok(ExitCode::SUCCESS)
 }
 

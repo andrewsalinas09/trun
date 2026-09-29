@@ -74,6 +74,30 @@ Deferred:
 window and `trun wait --until stalled` returns with exit code 2. A NaN metric fails
 the run's health. Replay reproduces both from recorded data.
 
+**Status: done (2026-09-29).** Verified on Windows 11 and Linux (WSL, static musl):
+- A silent script is stalled 10 s in, with the limit at 8 s, and `wait` exits 2.
+- A NaN metric makes health `failing`, and `wait --until failing` exits 6.
+- `check test builtin:defaults` replays both at the right offsets.
+- The zombie alert fires from real process-tree CPU samples.
+- A check with `kill: True` stops the run, with diagnosis `killed-by-check`.
+- A broken check surfaces as `check_error` without affecting the run.
+- Desktop notifications work on Windows. Without a D-Bus session they are skipped
+  with one warning.
+
+Beyond the plan:
+- `trun check lint`.
+- Thresholds in `config.toml`.
+- A `builtin:alerts` dashboard cell.
+- Alerts in the UI's messages feed.
+- A `failing` wait condition (exit 6).
+
+Deferred:
+- Recording samples so replays see CPU, memory, disk, and GPU (M4).
+- GPU checks (M4, needs NVML).
+- `shutdown_host` (M7).
+- `load()` of shared Starlark helpers.
+- Hub-side agent-silence checks (M4).
+
 ## M4 · Remote agents
 
 - `trun agent` over SSH (`trun hosts add`, `--install`, `--stdio`) and join mode (outbound WSS), heartbeats

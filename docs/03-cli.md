@@ -40,10 +40,14 @@ trun diff RUN_A RUN_B           # compare duration, steps, final metrics, diagno
 ## Waiting (the wake-up primitive)
 
 ```sh
-trun wait RUN --until done,failed,stalled,lost,preempted,alert [--timeout 2h] [--quiet]
+trun wait RUN [--until done,stalled,failing] [--timeout 2h] [--quiet]
 ```
 
-This blocks until any listed condition is true, then prints a digest.
+This blocks until any listed condition is true, then prints a digest (with
+`--quiet`, one line). Conditions: `done` (any end), `succeeded`, `failed`,
+`stalled`, `failing` (health), `alert` (any warn+ alert open), `lost`, `preempted`.
+The default is `done,stalled,failing`. A run that ends always returns, because it
+can't meet a health condition later.
 
 | Exit code | Meaning |
 |---|---|
@@ -53,6 +57,7 @@ This blocks until any listed condition is true, then prints a digest.
 | 3 | Lost or preempted |
 | 4 | Timeout reached |
 | 5 | An alert fired (with `--until alert`) |
+| 6 | Health became failing (e.g. a NaN metric, `fail()`) |
 | 10 | Usage or connection error |
 
 It is designed for AI agents: run `trun wait` as a background command, and the harness
@@ -99,8 +104,10 @@ trun doctor                                            # check daemon, GPU acces
 ## Authoring helpers (for humans and AI)
 
 ```sh
-trun lint [path]                # validate .trun/ panels, checks, parsers, templates
-trun check test <file> --run RUN   # replay a check against a recorded run's data
+trun lint [path]                # (planned) validate all of .trun/: panels, checks, parsers, templates
+trun check lint [FILE...]       # compile checks and show META (default: project + global + builtins)
+trun check test FILE --run RUN [--with-defaults]   # replay a check against a recorded run
+trun check test builtin:defaults --run RUN         # how the default checks saw a run
 trun parse test <file> < sample.log # show which events a parser emits for input
 trun ui                         # open the UI (Tauri app if installed, else browser)
 trun mcp                        # stdio MCP server

@@ -52,6 +52,25 @@ export interface StepState {
   progressed_at: number | null;
 }
 
+export type AlertLevel = "info" | "warn" | "stalled" | "fail";
+
+export interface Alert {
+  key: string;
+  check: string;
+  level: AlertLevel;
+  message: string;
+  opened_at: number;
+  last_at: number;
+  count: number;
+}
+
+export const LEVEL_RANK: Record<AlertLevel, number> = { info: 0, warn: 1, stalled: 2, fail: 3 };
+
+export function healthOf(alerts: Alert[]): Health {
+  const worst = alerts.reduce((m, a) => Math.max(m, LEVEL_RANK[a.level]), 0);
+  return (["ok", "warn", "stalled", "failing"] as const)[worst];
+}
+
 export interface MetricLast {
   value: WireNum;
   step: number | null;
@@ -84,6 +103,7 @@ export interface RunSummary {
   expect_silence_ms: number | null;
   config_root: string | null;
   pty: boolean;
+  alerts: Alert[];
 }
 
 export interface LogLine {
@@ -124,6 +144,15 @@ export type RunEvent = { run_id: string; seq: number; ts: number } & (
   | { kind: "metric"; values: Record<string, WireNum>; step?: number }
   | { kind: "log"; level: "info" | "warn" | "error"; text: string }
   | { kind: "note"; text: string; author: string }
+  | {
+      kind: "alert";
+      key: string;
+      check: string;
+      level: AlertLevel;
+      message: string;
+      state: "opened" | "updated" | "cleared";
+    }
+  | { kind: "check_error"; check: string; error: string }
 );
 
 export interface MetricPoint {

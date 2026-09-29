@@ -1,0 +1,17 @@
+[package]
+name = "trun-checks"
+description = "Checks for trun: run data as time series, the Starlark check engine, alert hysteresis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+trun-proto.workspace = true
+anyhow.workspace = true
+starlark = "0.14"
+starlark_derive = "0.14"
+allocative = "0.3"
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

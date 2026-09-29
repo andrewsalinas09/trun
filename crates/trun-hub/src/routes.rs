@@ -557,7 +557,12 @@ async fn run_messages(
     let run = resolve(&st, &id).await?;
     let store = st.store.clone();
     let events = tokio::task::spawn_blocking(move || {
-        store.events_of_kind(&run.project, &run.id, &["log", "note"], 500)
+        store.events_of_kind(
+            &run.project,
+            &run.id,
+            &["log", "note", "alert", "check_error"],
+            500,
+        )
     })
     .await??;
     Ok(Json(events))

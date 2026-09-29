@@ -14,6 +14,7 @@ path = "src/main.rs"
 trun-proto.workspace = true
 trun-hub.workspace = true
 trun-parse.workspace = true
+trun-checks.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 futures-util.workspace = true

@@ -5,6 +5,8 @@
 //! requires the per-user token from `~/.trun/hub.token` on every `/api` call, as a
 //! bearer header or the cookie set by visiting `/?t=<token>` (what `trun ui` opens).
 
+pub mod config;
+mod notify;
 pub mod panels;
 pub mod paths;
 mod routes;
@@ -67,7 +69,20 @@ pub async fn serve(cfg: HubConfig) -> Result<()> {
         .with_context(|| format!("binding {addr} (is another hub already running?)"))?;
     let url = format!("http://127.0.0.1:{}", cfg.port);
 
-    let agent = Agent::new(store.clone(), url.clone());
+    let cfg_file = config::Config::load(&cfg.paths.home);
+    for w in &cfg_file.warnings {
+        tracing::warn!("config: {w}");
+    }
+    let agent_config = trun_agent::AgentConfig {
+        home: Some(cfg.paths.home.clone()),
+        check_config: cfg_file.check_thresholds.clone(),
+        notifier: Some(if cfg_file.desktop_notifications {
+            notify::desktop()
+        } else {
+            notify::log_only()
+        }),
+    };
+    let agent = Agent::new(store.clone(), url.clone(), agent_config);
     let state = AppState {
         agent,
         store,

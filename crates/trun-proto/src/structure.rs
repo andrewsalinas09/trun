@@ -32,19 +32,59 @@ impl Serialize for Num {
 }
 
 impl<'de> Deserialize<'de> for Num {
+    // An explicit visitor rather than `#[serde(untagged)]`: some dependencies (e.g.
+    // starlark) enable serde_json's `arbitrary_precision`, which delivers numbers to
+    // untagged enums as a private map and breaks them. The map form is handled here.
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            N(f64),
-            S(String),
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Num;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a number or one of \"NaN\", \"inf\", \"-inf\"")
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Num, E> {
+                Ok(Num(v))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Num, E> {
+                Ok(Num(v as f64))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Num, E> {
+                Ok(Num(v as f64))
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Num, E> {
+                parse_num(s)
+                    .map(Num)
+                    .ok_or_else(|| E::custom(format!("not a number: {s:?}")))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut m: A) -> Result<Num, A::Error> {
+                // serde_json arbitrary_precision: {"$serde_json::private::Number": "1.5"}
+                let (_k, v): (String, String) = m
+                    .next_entry()?
+                    .ok_or_else(|| serde::de::Error::custom("empty map for number"))?;
+                self.visit_str(&v)
+            }
         }
-        match Raw::deserialize(d)? {
-            Raw::N(v) => Ok(Num(v)),
-            Raw::S(s) => parse_num(&s)
-                .map(Num)
-                .ok_or_else(|| serde::de::Error::custom(format!("not a number: {s:?}"))),
-        }
+        d.deserialize_any(V)
+    }
+}
+
+/// Float field deserializers that survive serde_json's `arbitrary_precision`.
+///
+/// starlark (used by trun-checks) enables that feature, and Cargo unifies it across
+/// the build. Under it, floats inside *buffered* serde paths (internally tagged enums,
+/// `#[serde(flatten)]`, untagged) arrive as a private map and a plain `f64` field fails
+/// with "invalid type: map, expected f64". Every float field that can travel through
+/// such a path uses these (D25).
+pub mod flex {
+    use super::Num;
+    use serde::{Deserialize, Deserializer};
+
+    pub fn f64<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        Num::deserialize(d).map(|n| n.0)
+    }
+
+    pub fn opt_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+        Option::<Num>::deserialize(d).map(|o| o.map(|n| n.0))
     }
 }
 
@@ -110,8 +150,9 @@ pub enum Directive {
         /// `None`: the most recently begun open step (or an implicit one).
         #[serde(default)]
         id: Option<String>,
+        #[serde(deserialize_with = "crate::structure::flex::f64")]
         current: f64,
-        #[serde(default)]
+        #[serde(deserialize_with = "crate::structure::flex::opt_f64", default)]
         total: Option<f64>,
         #[serde(default)]
         unit: Option<String>,
@@ -164,14 +205,14 @@ pub struct StepState {
     pub parent: Option<String>,
     pub name: String,
     pub state: StepRunState,
-    #[serde(default)]
+    #[serde(deserialize_with = "crate::structure::flex::opt_f64", default)]
     pub current: Option<f64>,
-    #[serde(default)]
+    #[serde(deserialize_with = "crate::structure::flex::opt_f64", default)]
     pub total: Option<f64>,
     #[serde(default)]
     pub unit: Option<String>,
     /// Smoothed progress rate, units per second.
-    #[serde(default)]
+    #[serde(deserialize_with = "crate::structure::flex::opt_f64", default)]
     pub rate: Option<f64>,
     #[serde(default)]
     pub eta_ms: Option<Millis>,
@@ -181,6 +222,61 @@ pub struct StepState {
     /// Last time `current` changed.
     #[serde(default)]
     pub progressed_at: Option<Millis>,
+}
+
+/// Severity of a check alert. Ordered: the worst open alert sets the run's health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertLevel {
+    Info,
+    Warn,
+    Stalled,
+    Fail,
+}
+
+impl AlertLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AlertLevel::Info => "info",
+            AlertLevel::Warn => "warn",
+            AlertLevel::Stalled => "stalled",
+            AlertLevel::Fail => "fail",
+        }
+    }
+
+    pub fn health(self) -> crate::Health {
+        match self {
+            AlertLevel::Info => crate::Health::Ok,
+            AlertLevel::Warn => crate::Health::Warn,
+            AlertLevel::Stalled => crate::Health::Stalled,
+            AlertLevel::Fail => crate::Health::Failing,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertState {
+    Opened,
+    /// Still firing, but its level or message changed.
+    Updated,
+    Cleared,
+}
+
+/// An open alert, as kept on the run summary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Alert {
+    /// Stable identity: check name plus the message with digits normalized (or an
+    /// explicit `key=`), so an alert with a changing number stays one alert.
+    pub key: String,
+    /// Check file name (stem), e.g. `defaults`, `training`.
+    pub check: String,
+    pub level: AlertLevel,
+    pub message: String,
+    pub opened_at: Millis,
+    pub last_at: Millis,
+    /// Evaluations that fired it.
+    pub count: u64,
 }
 
 /// Latest value of a metric, kept on the run summary for digests and lists.
@@ -209,6 +305,20 @@ mod tests {
         let j = serde_json::to_string(&Num(f64::NAN)).unwrap();
         assert_eq!(j, "\"NaN\"");
         assert!(serde_json::from_str::<Num>(&j).unwrap().0.is_nan());
+    }
+
+    #[test]
+    fn num_inside_structs_and_integers() {
+        // Regression: must work when serde_json's arbitrary_precision is enabled by
+        // another crate in the build (starlark does this).
+        let m: MetricLast =
+            serde_json::from_str(r#"{"value":3.0,"step":null,"ts":1,"count":2,"non_finite":0}"#)
+                .unwrap();
+        assert_eq!(m.value, Num(3.0));
+        let m: MetricLast = serde_json::from_str(r#"{"value":7,"ts":1,"count":1}"#).unwrap();
+        assert_eq!(m.value, Num(7.0));
+        let v: Vec<Num> = serde_json::from_str(r#"[1, -2, 0.5, "inf"]"#).unwrap();
+        assert_eq!(v, vec![Num(1.0), Num(-2.0), Num(0.5), Num(f64::INFINITY)]);
     }
 
     #[test]

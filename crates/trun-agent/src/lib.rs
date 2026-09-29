@@ -10,6 +10,7 @@
 
 mod naming;
 pub mod project;
+mod sampler;
 mod sidechannel;
 mod structure;
 
@@ -43,6 +44,12 @@ const RETAIN_FINISHED: Duration = Duration::from_secs(60);
 const SUMMARY_PUBLISH_EVERY: Duration = Duration::from_secs(1);
 /// Coalesced progress events go out on this tick.
 const PROGRESS_TICK: Duration = Duration::from_millis(250);
+/// How often due checks are evaluated (each check has its own `every`).
+const CHECK_TICK: Duration = Duration::from_secs(1);
+/// How often check files are re-scanned for changes (hot reload).
+const CHECK_RESCAN_MS: i64 = 3000;
+/// Successful runs only notify when they took at least this long.
+const NOTIFY_SUCCESS_AFTER_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Clone)]
 pub struct Agent {
@@ -53,8 +60,28 @@ struct Inner {
     host: String,
     hub_url: String,
     store: Store,
+    config: AgentConfig,
     runs: Mutex<HashMap<String, Arc<RunHandle>>>,
     fleet: broadcast::Sender<RunSummary>,
+}
+
+/// A desktop/phone notification the hub should deliver.
+#[derive(Debug, Clone)]
+pub struct Notification {
+    pub run_id: String,
+    pub title: String,
+    pub body: String,
+}
+
+pub type Notifier = Arc<dyn Fn(Notification) + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct AgentConfig {
+    /// `$TRUN_HOME`: global checks live in `<home>/checks`.
+    pub home: Option<PathBuf>,
+    /// `[defaults.checks]` thresholds (durations in seconds).
+    pub check_config: std::collections::BTreeMap<String, f64>,
+    pub notifier: Option<Notifier>,
 }
 
 pub struct RunHandle {
@@ -62,11 +89,15 @@ pub struct RunHandle {
     live: broadcast::Sender<Arc<Event>>,
     killer: Mutex<Option<Killer>>,
     cancel_requested: AtomicBool,
+    /// Set when a check stopped the run (the reason).
+    killed_by_check: Mutex<Option<String>>,
 }
 
 struct RunState {
     summary: RunSummary,
     structure: Structure,
+    /// What checks see; fed by every emitted event plus samples.
+    data: trun_checks::RunData,
     ring: VecDeque<Arc<Event>>,
     next_seq: u64,
 }
@@ -98,18 +129,45 @@ pub struct Subscription {
 }
 
 impl Agent {
-    pub fn new(store: Store, hub_url: String) -> Self {
+    pub fn new(store: Store, hub_url: String, config: AgentConfig) -> Self {
         let host = gethostname::gethostname().to_string_lossy().into_owned();
         let (fleet, _) = broadcast::channel(1024);
-        Agent {
+        let agent = Agent {
             inner: Arc::new(Inner {
                 host,
                 hub_url,
                 store,
+                config,
                 runs: Mutex::new(HashMap::new()),
                 fleet,
             }),
+        };
+        sampler::spawn(agent.clone());
+        agent
+    }
+
+    fn notify(&self, n: Notification) {
+        if let Some(f) = &self.inner.config.notifier {
+            f(n);
         }
+    }
+
+    /// Runs currently alive with a known root pid and working directory (for the sampler).
+    fn sample_targets(&self) -> Vec<(Arc<RunHandle>, u32, String)> {
+        let handles: Vec<Arc<RunHandle>> =
+            self.inner.runs.lock().unwrap().values().cloned().collect();
+        handles
+            .into_iter()
+            .filter_map(|h| {
+                let st = h.state.lock().unwrap();
+                let s = &st.summary;
+                (s.lifecycle == Lifecycle::Running).then_some(())?;
+                let pid = s.pid?;
+                let cwd = s.cwd.clone();
+                drop(st);
+                Some((h, pid, cwd))
+            })
+            .collect()
     }
 
     pub fn host(&self) -> &str {
@@ -202,12 +260,18 @@ impl Agent {
             state: Mutex::new(RunState {
                 summary: summary.clone(),
                 structure: Structure::default(),
+                data: {
+                    let mut d = trun_checks::RunData::new(&id, &summary.name, &summary.project);
+                    d.config = self.inner.config.check_config.clone();
+                    d
+                },
                 ring: VecDeque::new(),
                 next_seq: 1,
             }),
             live,
             killer: Mutex::new(None),
             cancel_requested: AtomicBool::new(false),
+            killed_by_check: Mutex::new(None),
         });
         self.inner
             .runs
@@ -284,6 +348,7 @@ impl Agent {
             st.ring.pop_front();
         }
         st.ring.push_back(ev.clone());
+        st.data.ingest(&ev);
         let _ = h.live.send(ev.clone());
         if let Err(e) = self
             .inner
@@ -297,7 +362,17 @@ impl Agent {
 
     /// Apply a directive to the run's structure and emit resulting events.
     fn apply(&self, h: &RunHandle, d: Directive) {
-        let kinds = h.state.lock().unwrap().structure.apply(d, now_ms());
+        let now = now_ms();
+        let kinds = {
+            let mut st = h.state.lock().unwrap();
+            // Not events, but checks need them.
+            match &d {
+                Directive::Heartbeat => st.data.heartbeat(now),
+                Directive::Expect { silence_ms } => st.data.expect_silence_ms = *silence_ms,
+                _ => {}
+            }
+            st.structure.apply(d, now)
+        };
         for k in kinds {
             self.emit(h, k);
         }
@@ -309,6 +384,96 @@ impl Agent {
             f(&mut st.summary);
         }
         self.publish_snapshot(h)
+    }
+
+    fn check_runner(&self, h: &RunHandle, req: &CreateRun) -> trun_checks::CheckRunner {
+        let (name, root) = {
+            let st = h.state.lock().unwrap();
+            (st.summary.name.clone(), st.summary.config_root.clone())
+        };
+        let discovery = trun_checks::Discovery {
+            project_dir: root.map(|r| PathBuf::from(r).join(".trun").join("checks")),
+            global_dir: self.inner.config.home.as_ref().map(|h| h.join("checks")),
+            extra: req.checks.iter().map(PathBuf::from).collect(),
+            defaults: !req.no_default_checks,
+        };
+        trun_checks::CheckRunner::new(discovery, &name, CHECK_RESCAN_MS)
+    }
+
+    /// Turn one check tick into events, summary health, notifications, and kills.
+    fn apply_check_outcome(
+        &self,
+        h: &RunHandle,
+        checks: &trun_checks::CheckRunner,
+        out: trun_checks::TickOutcome,
+    ) {
+        let (run_id, run_name) = {
+            let st = h.state.lock().unwrap();
+            (st.summary.id.clone(), st.summary.name.clone())
+        };
+        for (check, error) in out.errors {
+            tracing::warn!(run = %run_id, check = %check, "check error: {error}");
+            self.emit(h, EventKind::CheckError { check, error });
+        }
+        if !out.changes.is_empty() {
+            for c in &out.changes {
+                let a = &c.alert;
+                self.emit(
+                    h,
+                    EventKind::Alert {
+                        key: a.key.clone(),
+                        check: a.check.clone(),
+                        level: a.level,
+                        message: a.message.clone(),
+                        state: c.state,
+                    },
+                );
+                let serious = a.level >= trun_proto::AlertLevel::Stalled;
+                if serious && c.state != trun_proto::AlertState::Cleared {
+                    let what = if a.level == trun_proto::AlertLevel::Fail {
+                        "failing"
+                    } else {
+                        "stalled"
+                    };
+                    self.notify(Notification {
+                        run_id: run_id.clone(),
+                        title: format!("⚠ {run_name} {what}"),
+                        body: a.message.clone(),
+                    });
+                }
+            }
+            let (alerts, health) = (checks.tracker.open_alerts(), checks.tracker.health());
+            self.update_summary(h, |s| {
+                s.alerts = alerts;
+                s.health = health;
+            });
+        }
+        for msg in out.notify {
+            self.notify(Notification {
+                run_id: run_id.clone(),
+                title: format!("trun: {run_name}"),
+                body: msg,
+            });
+        }
+        if let Some(why) = out.kill {
+            let first = h
+                .killed_by_check
+                .lock()
+                .unwrap()
+                .replace(why.clone())
+                .is_none();
+            if first {
+                tracing::warn!(run = %run_id, "check requested kill: {why}");
+                self.emit(
+                    h,
+                    EventKind::Log {
+                        level: LogLevel::Error,
+                        text: format!("trun: stopping run: {why}"),
+                    },
+                );
+                self.cancel(&run_id, false);
+            }
+        }
     }
 
     async fn drive(&self, h: Arc<RunHandle>, req: CreateRun) {
@@ -404,6 +569,9 @@ impl Agent {
         let mut exit_rx = proc.exit;
 
         let mut parsers = ParserSet::new();
+        let mut checks = self.check_runner(&h, &req);
+        let mut check_tick = tokio::time::interval(CHECK_TICK);
+        check_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut diagnoser = Diagnoser::default();
         let mut status: Option<ExitStatusInfo> = None;
         let mut drain_deadline: Option<tokio::time::Instant> = None;
@@ -468,6 +636,13 @@ impl Agent {
                     tracing::debug!(run = %run_id, "output still open after exit (leftover child processes); stop reading");
                     break;
                 }
+                _ = check_tick.tick() => {
+                    let out = {
+                        let st = h.state.lock().unwrap();
+                        checks.tick(&st.data, now_ms())
+                    };
+                    self.apply_check_outcome(&h, &checks, out);
+                }
                 _ = progress_tick.tick() => {
                     let kinds = h.state.lock().unwrap().structure.flush_progress(now_ms());
                     for k in kinds {
@@ -497,8 +672,11 @@ impl Agent {
         drop(side);
 
         let status = status.unwrap_or_default();
-        let cancelled = h.cancel_requested.load(Ordering::SeqCst);
-        let lifecycle = if cancelled {
+        let killed_by_check = h.killed_by_check.lock().unwrap().clone();
+        let cancelled = h.cancel_requested.load(Ordering::SeqCst) && killed_by_check.is_none();
+        let lifecycle = if killed_by_check.is_some() {
+            Lifecycle::Failed
+        } else if cancelled {
             Lifecycle::Cancelled
         } else if status.success() {
             Lifecycle::Succeeded
@@ -512,8 +690,19 @@ impl Agent {
             cancelled,
             elapsed_ms: started.elapsed().as_millis() as i64,
         };
-        let diagnosis = diagnoser.diagnose(&exit);
-        let reason = cancelled.then(|| "cancelled by request".to_string());
+        let diagnosis = match &killed_by_check {
+            Some(why) => Some(trun_proto::Diagnosis {
+                cause: "killed-by-check".into(),
+                summary: format!("Stopped by a check: {why}"),
+                early: false,
+                evidence: vec![],
+            }),
+            None => diagnoser.diagnose(&exit),
+        };
+        let reason = match &killed_by_check {
+            Some(why) => Some(format!("killed by check: {why}")),
+            None => cancelled.then(|| "cancelled by request".to_string()),
+        };
         self.finish(&h, lifecycle, status, diagnosis, reason);
     }
 
@@ -555,6 +744,28 @@ impl Agent {
             s.diagnosis = diagnosis;
         });
         tracing::info!(run = %s.id, lifecycle = s.lifecycle.as_str(), code = ?s.exit_code, "run finished");
+        if s.lifecycle == Lifecycle::Failed {
+            let why = s
+                .diagnosis
+                .as_ref()
+                .map(|d| d.summary.clone())
+                .unwrap_or_else(|| "failed".into());
+            self.notify(Notification {
+                run_id: s.id.clone(),
+                title: format!("✗ {} failed", s.name),
+                body: why,
+            });
+        } else if s.lifecycle == Lifecycle::Succeeded
+            && s.elapsed_ms(now_ms())
+                .is_some_and(|e| e >= NOTIFY_SUCCESS_AFTER_MS)
+        {
+            let took = s.elapsed_ms(now_ms()).unwrap_or(0) / 1000;
+            self.notify(Notification {
+                run_id: s.id.clone(),
+                title: format!("✓ {} succeeded", s.name),
+                body: format!("after {}m{:02}s", took / 60, took % 60),
+            });
+        }
 
         let agent = self.clone();
         let id = s.id.clone();

@@ -130,6 +130,7 @@ pub struct DashboardSpec {
 pub const BUILTINS: &[&str] = &[
     "builtin:header",
     "builtin:diagnosis",
+    "builtin:alerts",
     "builtin:steps",
     "builtin:metrics",
     "builtin:log",

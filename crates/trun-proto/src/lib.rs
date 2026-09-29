@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub use structure::{
-    Directive, LogLevel, MetricLast, Num, StepRunState, StepState, StepStatus, parse_num,
+    Alert, AlertLevel, AlertState, Directive, LogLevel, MetricLast, Num, StepRunState, StepState,
+    StepStatus, parse_num,
 };
 
 pub const DEFAULT_PORT: u16 = 7317;
@@ -221,12 +222,21 @@ pub enum EventKind {
     /// Throttled progress snapshot of one step (rate and ETA computed by the agent).
     Progress {
         id: String,
+        #[serde(deserialize_with = "crate::structure::flex::f64")]
         current: f64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            deserialize_with = "crate::structure::flex::opt_f64",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         total: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         unit: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            deserialize_with = "crate::structure::flex::opt_f64",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         rate: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         eta_ms: Option<Millis>,
@@ -245,6 +255,18 @@ pub enum EventKind {
         /// `run` (the program), `human`, or `agent`.
         author: String,
     },
+    Alert {
+        key: String,
+        check: String,
+        level: AlertLevel,
+        message: String,
+        state: AlertState,
+    },
+    /// A check failed to compile or raised an error (reported once per distinct error).
+    CheckError {
+        check: String,
+        error: String,
+    },
 }
 
 impl EventKind {
@@ -259,6 +281,8 @@ impl EventKind {
             EventKind::Metric { .. } => "metric",
             EventKind::Log { .. } => "log",
             EventKind::Note { .. } => "note",
+            EventKind::Alert { .. } => "alert",
+            EventKind::CheckError { .. } => "check_error",
         }
     }
 }
@@ -307,6 +331,9 @@ pub struct RunSummary {
     /// Ran under a pseudo-terminal (stdout and stderr are merged).
     #[serde(default)]
     pub pty: bool,
+    /// Open check alerts (the worst one sets `health`).
+    #[serde(default)]
+    pub alerts: Vec<Alert>,
 }
 
 impl RunSummary {
@@ -345,6 +372,12 @@ pub struct CreateRun {
     /// Run under a pseudo-terminal (for programs that behave differently without a TTY).
     #[serde(default)]
     pub pty: bool,
+    /// Skip the built-in default checks.
+    #[serde(default)]
+    pub no_default_checks: bool,
+    /// Extra check files (absolute paths on the run's host).
+    #[serde(default)]
+    pub checks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

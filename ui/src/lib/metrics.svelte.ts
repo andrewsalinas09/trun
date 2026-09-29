@@ -17,13 +17,20 @@ function toPt(p: MetricPoint): Pt {
   return { s: p.s ?? null, t: p.t, v: num(p.v) };
 }
 
+/** Holds series outside Svelte's reactivity and publishes immutable snapshots via
+ *  `onChange`; the owning component keeps the snapshot in its own `$state.raw`.
+ *  (A `$derived` over a class's `$state` field, read only inside snippets, did not
+ *  reliably update.) */
 export class MetricStore {
-  series = $state<Record<string, Pt[]>>({});
-  downsampled = $state<Record<string, boolean>>({});
+  series: Record<string, Pt[]> = {};
+  downsampled: Record<string, boolean> = {};
   private pending: Record<string, Pt[]> = {};
   private timer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(private runId: string) {}
+  constructor(
+    private runId: string,
+    private onChange: (series: Record<string, Pt[]>) => void,
+  ) {}
 
   /** Load history for every metric the run has reported so far. */
   async load(): Promise<void> {
@@ -43,6 +50,7 @@ export class MetricStore {
     }
     this.series = next;
     this.downsampled = ds;
+    this.onChange(next);
   }
 
   push(values: Record<string, number>, step: number | null, t: number): void {
@@ -60,6 +68,7 @@ export class MetricStore {
     }
     this.pending = {};
     this.series = next;
+    this.onChange(next);
   }
 
   dispose(): void {
