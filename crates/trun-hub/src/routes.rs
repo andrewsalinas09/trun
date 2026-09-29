@@ -31,6 +31,10 @@ pub fn router(state: AppState) -> Router {
         .route("/runs/{id}/logs", get(run_logs))
         .route("/runs/{id}/events", get(run_events))
         .route("/runs/{id}/cancel", post(cancel_run))
+        .route("/runs/{id}/metrics", get(run_metrics))
+        .route("/runs/{id}/messages", get(run_messages))
+        .route("/runs/{id}/panels", get(run_panels))
+        .route("/runs/{id}/panels/stream", get(panels_stream))
         .route("/projects", get(list_projects))
         .route("/stream", get(fleet_stream))
         .route("/shutdown", post(shutdown))
@@ -178,6 +182,7 @@ async fn root_or_static(
 async fn health(State(st): State<AppState>) -> Json<HealthInfo> {
     Json(HealthInfo {
         version: env!("CARGO_PKG_VERSION").into(),
+        build: trun_proto::build_id(),
         pid: std::process::id(),
         data_dir: st.data_dir.clone(),
         started_at: st.started_at,
@@ -512,6 +517,106 @@ async fn cancel_run(
         ));
     }
     Ok(Json(st.agent.summary(&run.id).unwrap_or(run)))
+}
+
+#[derive(Deserialize, Default)]
+struct MetricsQuery {
+    /// Comma-separated names; default: every metric the run has reported.
+    names: Option<String>,
+    max_points: Option<usize>,
+}
+
+async fn run_metrics(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<MetricsQuery>,
+) -> ApiResult<Json<Vec<trun_proto::MetricSeries>>> {
+    let run = resolve(&st, &id).await?;
+    let names: Vec<String> = match q.names.as_deref() {
+        Some(n) if !n.is_empty() => n
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => run.metrics.keys().cloned().collect(),
+    };
+    let max_points = q.max_points.unwrap_or(1500).clamp(4, 100_000);
+    let store = st.store.clone();
+    let series = tokio::task::spawn_blocking(move || {
+        store.metric_series(&run.project, &run.id, &names, max_points)
+    })
+    .await??;
+    Ok(Json(series))
+}
+
+/// Notes and warn/error/info log events: the "what should I know" feed.
+async fn run_messages(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<Event>>> {
+    let run = resolve(&st, &id).await?;
+    let store = st.store.clone();
+    let events = tokio::task::spawn_blocking(move || {
+        store.events_of_kind(&run.project, &run.id, &["log", "note"], 500)
+    })
+    .await??;
+    Ok(Json(events))
+}
+
+fn load_panels(st: &AppState, run: &RunSummary) -> crate::panels::PanelSet {
+    crate::panels::load(
+        run.config_root.as_deref().map(std::path::Path::new),
+        &st.home,
+        &run.name,
+    )
+}
+
+async fn run_panels(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<crate::panels::PanelSet>> {
+    let run = resolve(&st, &id).await?;
+    let st2 = st.clone();
+    Ok(Json(
+        tokio::task::spawn_blocking(move || load_panels(&st2, &run)).await?,
+    ))
+}
+
+/// The run's panel set now, then again every time a panel or dashboard file changes.
+async fn panels_stream(State(st): State<AppState>, Path(id): Path<String>) -> ApiResult<Response> {
+    let run = resolve(&st, &id).await?;
+    let (mut project_rx, mut global_rx) = st
+        .watcher
+        .subscribe(run.config_root.as_deref().map(std::path::Path::new));
+    let (tx, rx) = mpsc::channel::<Result<SseEvent, Infallible>>(8);
+    tokio::spawn(async move {
+        let mut project_open = true;
+        loop {
+            let (st2, run2) = (st.clone(), run.clone());
+            let Ok(set) = tokio::task::spawn_blocking(move || load_panels(&st2, &run2)).await
+            else {
+                return;
+            };
+            let Ok(ev) = SseEvent::default().event("panels").json_data(&set) else {
+                return;
+            };
+            if tx.send(Ok(ev)).await.is_err() {
+                return;
+            }
+            tokio::select! {
+                r = project_rx.recv(), if project_open => {
+                    if matches!(r, Err(broadcast::error::RecvError::Closed)) { project_open = false; }
+                }
+                r = global_rx.recv() => {
+                    if matches!(r, Err(broadcast::error::RecvError::Closed)) { return; }
+                }
+                _ = tx.closed() => return,
+            }
+        }
+    });
+    Ok(Sse::new(ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response())
 }
 
 async fn list_projects(

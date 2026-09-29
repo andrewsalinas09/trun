@@ -3,13 +3,34 @@
 //! Everything that crosses a process boundary (hub <-> CLI, hub <-> UI, later
 //! hub <-> remote agent) is defined here so every side agrees on the shape.
 
+mod structure;
+
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+pub use structure::{
+    Directive, LogLevel, MetricLast, Num, StepRunState, StepState, StepStatus, parse_num,
+};
 
 pub const DEFAULT_PORT: u16 = 7317;
 pub const ADHOC_PROJECT: &str = "_adhoc";
 
 /// Milliseconds since the Unix epoch.
 pub type Millis = i64;
+
+/// Identity of the current executable: size and modification time. A hub running
+/// from a copy (see the CLI's daemon module) reports the same value, because file
+/// copies preserve the modification time.
+pub fn build_id() -> Option<String> {
+    let meta = std::fs::metadata(std::env::current_exe().ok()?).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(format!("{:x}-{:x}", meta.len(), mtime))
+}
 
 pub fn now_ms() -> Millis {
     std::time::SystemTime::now()
@@ -23,9 +44,10 @@ pub fn now_ms() -> Millis {
 // ---------------------------------------------------------------------------
 
 /// Where a run is in its life. Orthogonal to [`Health`] (see docs/decisions.md D8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lifecycle {
+    #[default]
     Queued,
     Starting,
     Running,
@@ -73,9 +95,10 @@ impl Lifecycle {
 }
 
 /// Is the run making progress? Only meaningful while running.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Health {
+    #[default]
     Ok,
     Warn,
     Stalled,
@@ -185,6 +208,43 @@ pub enum EventKind {
         reason: Option<String>,
     },
     Diagnosis(Diagnosis),
+    StepBegin {
+        id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
+    },
+    StepEnd {
+        id: String,
+        status: StepStatus,
+    },
+    /// Throttled progress snapshot of one step (rate and ETA computed by the agent).
+    Progress {
+        id: String,
+        current: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unit: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        eta_ms: Option<Millis>,
+    },
+    Metric {
+        values: BTreeMap<String, Num>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step: Option<i64>,
+    },
+    Log {
+        level: LogLevel,
+        text: String,
+    },
+    Note {
+        text: String,
+        /// `run` (the program), `human`, or `agent`.
+        author: String,
+    },
 }
 
 impl EventKind {
@@ -193,6 +253,12 @@ impl EventKind {
             EventKind::Output { .. } => "output",
             EventKind::Lifecycle { .. } => "lifecycle",
             EventKind::Diagnosis(_) => "diagnosis",
+            EventKind::StepBegin { .. } => "step_begin",
+            EventKind::StepEnd { .. } => "step_end",
+            EventKind::Progress { .. } => "progress",
+            EventKind::Metric { .. } => "metric",
+            EventKind::Log { .. } => "log",
+            EventKind::Note { .. } => "note",
         }
     }
 }
@@ -202,7 +268,7 @@ impl EventKind {
 // ---------------------------------------------------------------------------
 
 /// Compact view of a run, as kept in the hub's run index.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct RunSummary {
     pub id: String,
     pub project: String,
@@ -223,6 +289,24 @@ pub struct RunSummary {
     pub last_seq: u64,
     /// Timestamp of the most recent output line, if any.
     pub last_output_at: Option<Millis>,
+    /// Most recent sign of life: output, heartbeat, or any structured event.
+    #[serde(default)]
+    pub last_activity_at: Option<Millis>,
+    /// Step tree, in begin order (capped; see the agent).
+    #[serde(default)]
+    pub steps: Vec<StepState>,
+    /// Latest value per metric name (capped).
+    #[serde(default)]
+    pub metrics: BTreeMap<String, MetricLast>,
+    /// Set by `::expect silence=…`; `None` means the default silence threshold.
+    #[serde(default)]
+    pub expect_silence_ms: Option<Millis>,
+    /// Directory holding the run's `.trun/` config (panels, dashboards), if any.
+    #[serde(default)]
+    pub config_root: Option<String>,
+    /// Ran under a pseudo-terminal (stdout and stderr are merged).
+    #[serde(default)]
+    pub pty: bool,
 }
 
 impl RunSummary {
@@ -239,6 +323,10 @@ impl RunSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthInfo {
     pub version: String,
+    /// Identity of the running executable (see [`build_id`]); lets a newer CLI
+    /// notice an outdated hub.
+    #[serde(default)]
+    pub build: Option<String>,
     pub pid: u32,
     pub data_dir: String,
     pub started_at: Millis,
@@ -254,6 +342,9 @@ pub struct CreateRun {
     pub project: Option<String>,
     #[serde(default)]
     pub env: Vec<(String, String)>,
+    /// Run under a pseudo-terminal (for programs that behave differently without a TTY).
+    #[serde(default)]
+    pub pty: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -287,6 +378,26 @@ pub struct ProjectInfo {
     pub run_count: u64,
     pub active_count: u64,
     pub last_run_at: Option<Millis>,
+}
+
+/// One point of a metric series. `s` = step (if the program gave one), `t` = time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricPoint {
+    #[serde(rename = "s", default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<i64>,
+    #[serde(rename = "t")]
+    pub ts: Millis,
+    #[serde(rename = "v")]
+    pub value: Num,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricSeries {
+    pub name: String,
+    pub points: Vec<MetricPoint>,
+    /// Number of stored points (may exceed `points.len()` when downsampled).
+    pub total: u64,
+    pub downsampled: bool,
 }
 
 /// Messages on the fleet-wide SSE stream (`/api/stream`).

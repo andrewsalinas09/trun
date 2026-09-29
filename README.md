@@ -63,23 +63,32 @@ trun wait train-v3 --until done,failed,stalled
 
 ## Status
 
-**M1 is implemented** (local supervisor, hub, SQLite store, and web UI) on Windows
-and Linux. See the [roadmap](docs/10-roadmap.md). Remote hosts, `trun wait`, checks,
-and MCP come in later milestones. The examples above that use them describe the
-design.
+**M1 and M2 are implemented** on Windows and Linux: the local supervisor, hub,
+SQLite store and web UI, plus structure: the `::` protocol, built-in parsers, the
+side channel, `--pty`, charts, and hot-reloading panels. See the
+[roadmap](docs/10-roadmap.md). Remote hosts, `trun wait`, checks, and MCP come in
+later milestones. The examples above that use them describe the design.
 
 What works today:
 
 ```sh
 trun run -- python train.py          # attached: streams output, exits with the run's code
 trun run -d --name nightly -- make   # detached: prints the run id, keeps running
-trun ls [-a]                         # runs, newest first (-a: active only)
-trun status nightly                  # digest: state, diagnosis, last output
+trun run --pty -- ./needs-a-tty      # under a pseudo-terminal (ConPTY / openpty)
+trun ls [-a]                         # runs, newest first, with live progress
+trun status nightly                  # digest: state, diagnosis, step tree, metrics, last output
 trun logs -f nightly [--grep re]     # output, then follow live
 trun cancel nightly [--force]        # stop the whole process tree
+trun emit progress build 3 10        # report structure from shell scripts
 trun ui [run]                        # open the web UI
 trun hub start|stop|status           # the hub auto-starts on first use
 ```
+
+Structure comes for free from tqdm, pytest, and cargo output. Anything else can
+print `::progress train 3/10`, `::metric loss=0.31 step=3`, `::step-begin eval`
+(see [04](docs/04-progress-protocol.md)), or use the dependency-free
+[Python helper](sdk/python/trun.py). Panels and dashboards are TOML files in
+`.trun/`. Try `trun run --cwd examples/training -- python train.py`, then `trun ui`.
 
 ## Development
 

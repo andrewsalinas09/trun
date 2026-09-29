@@ -5,9 +5,11 @@
 //! requires the per-user token from `~/.trun/hub.token` on every `/api` call, as a
 //! bearer header or the cookie set by visiting `/?t=<token>` (what `trun ui` opens).
 
+pub mod panels;
 pub mod paths;
 mod routes;
 mod ui;
+mod watcher;
 
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
@@ -18,6 +20,9 @@ use trun_proto::now_ms;
 use trun_store::Store;
 
 pub use paths::{HubInfo, Paths};
+
+/// After shutdown is requested, how long open connections get before the hub exits.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct HubConfig {
@@ -34,6 +39,9 @@ pub struct AppState {
     pub started_at: i64,
     pub data_dir: String,
     pub shutdown: Arc<Notify>,
+    /// `$TRUN_HOME`: global panels and dashboards live here.
+    pub home: std::path::PathBuf,
+    pub watcher: watcher::ConfigWatcher,
 }
 
 /// Run the hub until Ctrl-C or `POST /api/shutdown`.
@@ -68,6 +76,8 @@ pub async fn serve(cfg: HubConfig) -> Result<()> {
         started_at: now_ms(),
         data_dir: data_dir.to_string_lossy().into_owned(),
         shutdown: Arc::new(Notify::new()),
+        home: cfg.paths.home.clone(),
+        watcher: watcher::ConfigWatcher::new(cfg.paths.home.clone()),
     };
 
     cfg.paths.write_hub_info(&HubInfo {
@@ -79,16 +89,26 @@ pub async fn serve(cfg: HubConfig) -> Result<()> {
     tracing::info!(%url, data_dir = %state.data_dir, "hub listening");
 
     let shutdown = state.shutdown.clone();
+    let stopping = Arc::new(Notify::new());
+    let stopping2 = stopping.clone();
     let app = routes::router(state.clone());
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = shutdown.notified() => {}
-            }
-            tracing::info!("hub shutting down");
-        })
-        .await?;
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = shutdown.notified() => {}
+        }
+        tracing::info!("hub shutting down");
+        stopping2.notify_one();
+    });
+    // Graceful shutdown waits for every connection to close, and live SSE streams
+    // (UIs, `trun logs -f`) never close on their own. Give them a moment, then go.
+    tokio::select! {
+        r = server => r?,
+        _ = async {
+            stopping.notified().await;
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+        } => tracing::info!("closing remaining connections"),
+    }
 
     // Only remove hub.json if it's still ours.
     if cfg

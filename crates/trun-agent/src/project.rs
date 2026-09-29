@@ -12,23 +12,49 @@ use std::path::{Path, PathBuf};
 use trun_proto::ADHOC_PROJECT;
 
 pub fn resolve_project(explicit: Option<&str>, cwd: &Path) -> String {
-    if let Some(p) = explicit.map(str::trim).filter(|p| !p.is_empty()) {
-        return p.to_string();
-    }
+    resolve(explicit, cwd).name
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Resolved {
+    pub name: String,
+    /// Where the project's `.trun/` config lives (panels, dashboards, checks):
+    /// the nearest ancestor with a `.trun/` directory, else the git root.
+    pub root: Option<PathBuf>,
+}
+
+pub fn resolve(explicit: Option<&str>, cwd: &Path) -> Resolved {
     // ~/.trun holds the *global* config, which never names a project.
     let home = dirs::home_dir();
+    let mut name: Option<String> = explicit
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+    let mut root: Option<PathBuf> = None;
     for dir in cwd.ancestors() {
         if home.as_deref() == Some(dir) {
             continue;
         }
-        if let Some(name) = trun_config_name(dir) {
-            return name;
+        if root.is_none() && dir.join(".trun").is_dir() {
+            root = Some(dir.to_path_buf());
         }
-        if let Some(name) = git_project_name(dir) {
-            return name;
+        if name.is_none()
+            && let Some(n) = trun_config_name(dir)
+        {
+            name = Some(n);
+        }
+        if let Some(n) = git_project_name(dir) {
+            name.get_or_insert(n);
+            root.get_or_insert_with(|| dir.to_path_buf());
+        }
+        if name.is_some() && root.is_some() {
+            break;
         }
     }
-    ADHOC_PROJECT.to_string()
+    Resolved {
+        name: name.unwrap_or_else(|| ADHOC_PROJECT.to_string()),
+        root,
+    }
 }
 
 fn trun_config_name(dir: &Path) -> Option<String> {
@@ -141,6 +167,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolve_project(None, &sub), "fromconfig");
+        let r = resolve(Some("explicit"), &sub);
+        assert_eq!(r.name, "explicit");
+        assert_eq!(r.root.as_deref(), Some(root.join("repo").as_path()));
 
         let _ = std::fs::remove_dir_all(&root);
     }

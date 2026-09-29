@@ -30,10 +30,48 @@ impl Client {
             base: format!("http://127.0.0.1:{port}"),
             token,
         };
-        if client.health().await.is_ok() {
-            return Ok(client);
-        }
-        if !autostart {
+        if let Ok(h) = client.health().await {
+            // Is it *our* hub? A hub started under another TRUN_HOME can hold the port.
+            let probe = client
+                .req(reqwest::Method::GET, "/runs?limit=1")
+                .send()
+                .await?;
+            if probe.status() == reqwest::StatusCode::UNAUTHORIZED {
+                bail!(
+                    "the hub on {} belongs to a different trun home ({}); stop it or use another port",
+                    client.base,
+                    h.data_dir
+                );
+            }
+            let mine = trun_proto::build_id();
+            let outdated = h.build.is_some() && mine.is_some() && h.build != mine;
+            if !outdated {
+                return Ok(client);
+            }
+            // The hub is from an older (or different) build of trun.
+            let active: Vec<trun_proto::RunSummary> =
+                client.get("/runs?active=true").await.unwrap_or_default();
+            if !autostart || !active.is_empty() {
+                eprintln!(
+                    "trun: note: the hub is running a different build of trun{}; restart it with `trun hub stop` when convenient",
+                    if active.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({} active run(s))", active.len())
+                    }
+                );
+                return Ok(client);
+            }
+            eprintln!("trun: restarting the hub (trun was updated)");
+            client.post_empty("/shutdown").await?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while client.health().await.is_ok() {
+                if std::time::Instant::now() > deadline {
+                    bail!("the old hub did not stop");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        } else if !autostart {
             bail!("no hub is running (start one with `trun hub start`)");
         }
         crate::daemon::spawn_hub(paths, port)?;

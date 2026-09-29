@@ -95,7 +95,7 @@
     border-color: var(--accent);
   }
   .log {
-    height: calc(100vh - 330px);
+    height: min(62vh, 640px);
     min-height: 320px;
     overflow: auto;
     padding: 8px 0;

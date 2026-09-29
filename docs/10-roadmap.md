@@ -36,6 +36,32 @@ launching shell. Known gaps carried forward:
 **Done when:** an unmodified tqdm training loop shows progress and ETA, and a TOML
 panel edited in an editor re-renders within 1 s.
 
+**Status: done (2026-09-29).** Verified on Windows 11 and Linux (WSL, static musl):
+- An unmodified tqdm loop gives a step per epoch, progress, rate, ETA, and `loss`
+  from the postfix, both with pipes and under `--pty`.
+- Real pytest (14 tests, failures, and metrics) and `cargo test` (a step per test
+  binary).
+- The `::` protocol, including NaN metrics and a malformed line surfaced as a
+  warning.
+- The Python helper over the side channel (named pipe on Windows, 0700 Unix socket
+  on Linux), and `trun emit` from bash.
+- Panel hot reload measured at about 100 ms. A broken TOML edit surfaces as a
+  per-file error with line and column.
+
+Beyond the plan:
+- A Windows ConPTY driver with passthrough mode where available and a normalizer
+  otherwise (D22).
+- The hub runs from a copy of the executable, with automatic restart when trun is
+  updated (D23).
+- A handle-inheritance fix so output capture of `trun` can't hang (D24).
+- A per-run `messages` feed (notes, warnings, and errors).
+- Collapsing long step lists in the UI.
+
+Deferred:
+- jest/vitest, HF Trainer, Lightning, and Keras parsers.
+- Panel sources other than `metric`.
+- TS panels (M6).
+
 ## M3 · Checks, stall detection, wait
 
 - Starlark check engine, time-series API, alert hysteresis, health axis

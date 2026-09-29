@@ -1,7 +1,7 @@
 // Thin client for the hub API. Auth is the HttpOnly cookie the hub sets when the
 // UI is opened via `trun ui` (`/?t=<token>`), so fetch and EventSource just work.
 
-import type { LogPage, ProjectInfo, RunSummary } from "./types";
+import type { LogPage, MetricSeries, ProjectInfo, RunEvent, RunSummary } from "./types";
 
 export class Unauthorized extends Error {}
 
@@ -35,6 +35,12 @@ export const api = {
     return request<LogPage>(`/runs/${encodeURIComponent(id)}/logs?${p}`);
   },
   projects: () => request<ProjectInfo[]>("/projects"),
+  messages: (id: string) => request<RunEvent[]>(`/runs/${encodeURIComponent(id)}/messages`),
+  metrics: (id: string, names?: string[], maxPoints = 1500) => {
+    const p = new URLSearchParams({ max_points: String(maxPoints) });
+    if (names) p.set("names", names.join(","));
+    return request<MetricSeries[]>(`/runs/${encodeURIComponent(id)}/metrics?${p}`);
+  },
   cancel: (id: string, force = false) =>
     request<RunSummary>(`/runs/${encodeURIComponent(id)}/cancel`, {
       method: "POST",

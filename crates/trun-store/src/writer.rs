@@ -124,6 +124,24 @@ fn apply(
                                 ])?;
                             }
                             other => {
+                                if let EventKind::Metric { values, step } = other {
+                                    let mut ins_metric = tx.prepare_cached(
+                                        "INSERT OR REPLACE INTO metrics (run_id, name, seq, ts, step, value, special)
+                                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                    )?;
+                                    for (name, v) in values {
+                                        let (value, special) = crate::encode_num(v.0);
+                                        ins_metric.execute(params![
+                                            e.run_id,
+                                            name,
+                                            e.seq as i64,
+                                            e.ts,
+                                            step,
+                                            value,
+                                            special
+                                        ])?;
+                                    }
+                                }
                                 let payload = serde_json::to_string(other).unwrap_or_default();
                                 ins_evt.execute(params![
                                     e.run_id,

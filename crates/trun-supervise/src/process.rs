@@ -1,14 +1,21 @@
 //! Spawning and killing supervised processes.
 //!
-//! * Unix: the child leads a new process group, so signals reach the whole tree.
+//! * Unix: the child leads a new process group (pipes) or session (pty), so
+//!   signals reach the whole tree.
 //! * Windows: the child is placed in a Job Object, so the whole tree can be
-//!   terminated; it gets a hidden console (`CREATE_NO_WINDOW`) so console programs
-//!   behave normally without flashing a window.
+//!   terminated; with pipes it gets a hidden console (`CREATE_NO_WINDOW`) so
+//!   console programs behave normally without flashing a window.
+//!
+//! Both modes produce the same [`Started`]: readers for output, a [`Killer`], and
+//! a channel that yields the exit status.
 
 use std::io;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
-use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::io::AsyncRead;
+use tokio::process::Command;
+use tokio::sync::oneshot;
 
 #[derive(Debug, Clone, Default)]
 pub struct SpawnSpec {
@@ -16,6 +23,8 @@ pub struct SpawnSpec {
     pub cwd: PathBuf,
     /// Extra environment on top of the inherited one.
     pub env: Vec<(String, String)>,
+    /// Run under a pseudo-terminal: one merged output stream, programs see a TTY.
+    pub pty: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -39,22 +48,34 @@ impl ExitStatusInfo {
     }
 }
 
-/// A running supervised process.
-pub struct Supervised {
-    child: Child,
-    pid: u32,
-    #[cfg(windows)]
-    job: Option<std::sync::Arc<win::Job>>,
+pub type BoxRead = Pin<Box<dyn AsyncRead + Send>>;
+
+/// A started process.
+pub struct Started {
+    pub pid: u32,
+    pub killer: Killer,
+    /// stdout, or the merged terminal output in pty mode.
+    pub stdout: BoxRead,
+    /// `None` in pty mode.
+    pub stderr: Option<BoxRead>,
+    /// Resolves once when the process exits.
+    pub exit: oneshot::Receiver<io::Result<ExitStatusInfo>>,
 }
 
-/// Spawn `spec` with piped stdout/stderr and null stdin.
-pub fn spawn(spec: &SpawnSpec) -> io::Result<(Supervised, ChildStdout, ChildStderr)> {
+pub fn start(spec: &SpawnSpec) -> io::Result<Started> {
     let (program, args) = spec
         .cmd
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty command"))?;
     let resolved = resolve_program(program, &spec.cwd)?;
+    if spec.pty {
+        crate::pty::start(spec, resolved, args)
+    } else {
+        start_piped(spec, resolved, args)
+    }
+}
 
+fn start_piped(spec: &SpawnSpec, resolved: PathBuf, args: &[String]) -> io::Result<Started> {
     let mut cmd = Command::new(&resolved);
     cmd.args(args)
         .current_dir(&spec.cwd)
@@ -65,7 +86,6 @@ pub fn spawn(spec: &SpawnSpec) -> io::Result<(Supervised, ChildStdout, ChildStde
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
-
     #[cfg(unix)]
     {
         cmd.process_group(0);
@@ -80,26 +100,37 @@ pub fn spawn(spec: &SpawnSpec) -> io::Result<(Supervised, ChildStdout, ChildStde
     let pid = child.id().unwrap_or(0);
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
+    let killer = Killer::for_pid(pid);
 
-    #[cfg(windows)]
-    let job = match win::Job::new().and_then(|j| j.assign(&child).map(|_| j)) {
-        Ok(j) => Some(std::sync::Arc::new(j)),
-        Err(e) => {
-            tracing::warn!(pid, error = %e, "could not assign process to job object; cancel will only kill the root process");
-            None
-        }
-    };
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let r = child.wait().await.map(|status| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                ExitStatusInfo {
+                    code: status.code(),
+                    signal: status.signal(),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                ExitStatusInfo {
+                    code: status.code(),
+                    signal: None,
+                }
+            }
+        });
+        let _ = tx.send(r);
+    });
 
-    Ok((
-        Supervised {
-            child,
-            pid,
-            #[cfg(windows)]
-            job,
-        },
-        stdout,
-        stderr,
-    ))
+    Ok(Started {
+        pid,
+        killer,
+        stdout: Box::pin(stdout),
+        stderr: Some(Box::pin(stderr)),
+        exit: rx,
+    })
 }
 
 /// Resolve the program via PATH (and PATHEXT on Windows, so `npm` finds `npm.cmd`).
@@ -121,40 +152,6 @@ fn resolve_program(program: &str, cwd: &std::path::Path) -> io::Result<PathBuf> 
     })
 }
 
-impl Supervised {
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    pub async fn wait(&mut self) -> io::Result<ExitStatusInfo> {
-        let status = self.child.wait().await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            Ok(ExitStatusInfo {
-                code: status.code(),
-                signal: status.signal(),
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(ExitStatusInfo {
-                code: status.code(),
-                signal: None,
-            })
-        }
-    }
-
-    /// A handle that can kill the process tree from another task while `wait` runs.
-    pub fn killer(&self) -> Killer {
-        Killer {
-            pid: self.pid,
-            #[cfg(windows)]
-            job: self.job.clone(),
-        }
-    }
-}
-
 /// Cheap, clonable handle for terminating a supervised process tree.
 #[derive(Clone)]
 pub struct Killer {
@@ -164,6 +161,25 @@ pub struct Killer {
 }
 
 impl Killer {
+    /// Take control of the tree rooted at `pid`: on Windows, put it in a Job Object.
+    pub(crate) fn for_pid(pid: u32) -> Self {
+        #[cfg(windows)]
+        {
+            let job = match win::Job::new().and_then(|j| j.assign_pid(pid).map(|_| j)) {
+                Ok(j) => Some(std::sync::Arc::new(j)),
+                Err(e) => {
+                    tracing::warn!(pid, error = %e, "could not assign process to a job object; cancel will only kill the root process");
+                    None
+                }
+            };
+            Killer { pid, job }
+        }
+        #[cfg(not(windows))]
+        {
+            Killer { pid }
+        }
+    }
+
     /// Ask the tree to stop (SIGTERM). On Windows there is no reliable graceful
     /// signal for a console-less tree, so this terminates the job.
     pub fn terminate(&self) {
@@ -199,7 +215,9 @@ mod win {
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
     };
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE, TerminateProcess,
+    };
 
     /// Owns a Job Object handle. Deliberately *not* KILL_ON_JOB_CLOSE: the hub
     /// closing the handle (e.g. on restart) must not kill user work.
@@ -219,15 +237,16 @@ mod win {
             }
         }
 
-        pub fn assign(&self, child: &tokio::process::Child) -> io::Result<()> {
-            let raw = child
-                .raw_handle()
-                .ok_or_else(|| io::Error::other("child already exited"))?;
-            let ok = unsafe { AssignProcessToJobObject(self.0, raw as HANDLE) };
-            if ok == 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
+        pub fn assign_pid(&self, pid: u32) -> io::Result<()> {
+            unsafe {
+                let h = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+                if h.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                let ok = AssignProcessToJobObject(self.0, h);
+                let err = io::Error::last_os_error();
+                CloseHandle(h);
+                if ok == 0 { Err(err) } else { Ok(()) }
             }
         }
 

@@ -29,14 +29,7 @@ fn run(id: &str, project: &str, name: &str, lc: Lifecycle) -> RunSummary {
         lifecycle: lc,
         health: Health::Ok,
         created_at: now_ms(),
-        started_at: None,
-        ended_at: None,
-        exit_code: None,
-        signal: None,
-        pid: None,
-        diagnosis: None,
-        last_seq: 0,
-        last_output_at: None,
+        ..Default::default()
     }
 }
 
@@ -164,6 +157,70 @@ fn orphans_become_lost() {
     assert_eq!(
         store.get_run("01DONE").unwrap().unwrap().lifecycle,
         Lifecycle::Succeeded
+    );
+}
+
+#[test]
+fn metric_series_keep_nan_and_downsample() {
+    use std::collections::BTreeMap;
+    use trun_proto::Num;
+    let store = Store::open(tempdir()).unwrap();
+    store
+        .upsert_run(&run("01MET", "p", "m", Lifecycle::Running))
+        .unwrap();
+    let mut events = Vec::new();
+    for i in 0..1000u64 {
+        let v = if i == 500 {
+            f64::NAN
+        } else if i == 700 {
+            1e9
+        } else {
+            i as f64
+        };
+        events.push(Event {
+            run_id: "01MET".into(),
+            seq: i + 1,
+            ts: i as i64,
+            kind: EventKind::Metric {
+                values: BTreeMap::from([("loss".to_string(), Num(v))]),
+                step: Some(i as i64),
+            },
+        });
+    }
+    store.append_events("p", events).unwrap();
+    store.flush();
+
+    let full = store
+        .metric_series("p", "01MET", &["loss".into()], 10_000)
+        .unwrap();
+    assert_eq!(full[0].points.len(), 1000);
+    assert!(!full[0].downsampled);
+    assert!(full[0].points[500].value.0.is_nan());
+
+    let small = store
+        .metric_series("p", "01MET", &["loss".into()], 100)
+        .unwrap();
+    let s = &small[0];
+    assert!(s.downsampled);
+    assert_eq!(s.total, 1000);
+    assert!(s.points.len() <= 110, "{}", s.points.len());
+    assert!(
+        s.points.iter().any(|p| p.value.0.is_nan()),
+        "NaN must survive downsampling"
+    );
+    assert!(
+        s.points.iter().any(|p| p.value.0 == 1e9),
+        "spikes must survive downsampling"
+    );
+    assert!(
+        s.points.windows(2).all(|w| w[0].ts <= w[1].ts),
+        "order preserved"
+    );
+
+    // Metric events also replay through the event log.
+    assert_eq!(
+        store.events("p", "01MET", 0, None, Some(5)).unwrap().len(),
+        5
     );
 }
 

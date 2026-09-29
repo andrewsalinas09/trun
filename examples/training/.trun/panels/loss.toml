@@ -1,0 +1,5 @@
+title  = "Training loss"
+kind   = "line"
+y      = ["loss", "val_loss"]
+x      = "step"
+smooth = 0.6

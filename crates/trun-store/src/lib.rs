@@ -19,7 +19,10 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use trun_proto::{Event, EventKind, Lifecycle, LogLine, ProjectInfo, RunSummary, Stream, now_ms};
+use trun_proto::{
+    Event, EventKind, Lifecycle, LogLine, MetricPoint, MetricSeries, Num, ProjectInfo, RunSummary,
+    Stream, now_ms,
+};
 use writer::{Op, WriterHandle};
 
 #[derive(Clone)]
@@ -322,6 +325,91 @@ impl Store {
         Ok(out)
     }
 
+    /// The most recent `limit` events of the given kinds (e.g. `log`, `note`), oldest first.
+    pub fn events_of_kind(
+        &self,
+        project: &str,
+        run_id: &str,
+        kinds: &[&str],
+        limit: u32,
+    ) -> Result<Vec<Event>> {
+        let Some(conn) = self.project_ro(project)? else {
+            return Ok(vec![]);
+        };
+        let placeholders = vec!["?"; kinds.len()].join(",");
+        let sql = format!(
+            "SELECT seq, ts, payload FROM events WHERE run_id = ? AND kind IN ({placeholders}) ORDER BY seq DESC LIMIT ?"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut args: Vec<rusqlite::types::Value> = vec![run_id.to_string().into()];
+        args.extend(
+            kinds
+                .iter()
+                .map(|k| rusqlite::types::Value::from(k.to_string())),
+        );
+        args.push((limit as i64).into());
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out: Vec<Event> = Vec::new();
+        for row in rows {
+            let (seq, ts, payload) = row?;
+            if let Ok(kind) = serde_json::from_str::<EventKind>(&payload) {
+                out.push(Event {
+                    run_id: run_id.to_string(),
+                    seq,
+                    ts,
+                    kind,
+                });
+            }
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    /// Metric series for a run. Series longer than `max_points` are downsampled
+    /// per bucket to its min and max point (spikes survive); NaN/inf points are
+    /// always kept.
+    pub fn metric_series(
+        &self,
+        project: &str,
+        run_id: &str,
+        names: &[String],
+        max_points: usize,
+    ) -> Result<Vec<MetricSeries>> {
+        let Some(conn) = self.project_ro(project)? else {
+            return Ok(vec![]);
+        };
+        let mut stmt = conn.prepare_cached(
+            "SELECT step, ts, value, special FROM metrics WHERE run_id = ?1 AND name = ?2 ORDER BY seq ASC",
+        )?;
+        let mut out = Vec::new();
+        for name in names {
+            let points: Vec<MetricPoint> = stmt
+                .query_map(params![run_id, name], |r| {
+                    Ok(MetricPoint {
+                        step: r.get(0)?,
+                        ts: r.get(1)?,
+                        value: Num(decode_num(r.get(2)?, r.get(3)?)),
+                    })
+                })?
+                .collect::<Result<_, _>>()?;
+            let total = points.len() as u64;
+            let (points, downsampled) = downsample(points, max_points.max(4));
+            out.push(MetricSeries {
+                name: name.clone(),
+                points,
+                total,
+                downsampled,
+            });
+        }
+        Ok(out)
+    }
+
     pub fn projects(&self) -> Result<Vec<ProjectInfo>> {
         let conn = self.hub_ro()?;
         let mut stmt = conn.prepare(
@@ -380,6 +468,64 @@ pub fn file_stem(project: &str) -> String {
     } else {
         s
     }
+}
+
+/// f64 → (REAL column, special code). SQLite cannot store NaN.
+pub(crate) fn encode_num(v: f64) -> (Option<f64>, i64) {
+    if v.is_nan() {
+        (None, 1)
+    } else if v == f64::INFINITY {
+        (None, 2)
+    } else if v == f64::NEG_INFINITY {
+        (None, 3)
+    } else {
+        (Some(v), 0)
+    }
+}
+
+fn decode_num(value: Option<f64>, special: i64) -> f64 {
+    match special {
+        1 => f64::NAN,
+        2 => f64::INFINITY,
+        3 => f64::NEG_INFINITY,
+        _ => value.unwrap_or(f64::NAN),
+    }
+}
+
+/// Min/max-per-bucket downsampling that keeps every non-finite point.
+fn downsample(points: Vec<MetricPoint>, max_points: usize) -> (Vec<MetricPoint>, bool) {
+    if points.len() <= max_points {
+        return (points, false);
+    }
+    let buckets = (max_points / 2).max(1);
+    let size = points.len().div_ceil(buckets);
+    let mut out = Vec::with_capacity(max_points + 8);
+    for chunk in points.chunks(size) {
+        let finite = || {
+            chunk
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.value.0.is_finite())
+        };
+        let lo = finite()
+            .min_by(|a, b| a.1.value.0.total_cmp(&b.1.value.0))
+            .map(|(i, _)| i);
+        let hi = finite()
+            .max_by(|a, b| a.1.value.0.total_cmp(&b.1.value.0))
+            .map(|(i, _)| i);
+        let mut keep: Vec<usize> = chunk
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.value.0.is_finite())
+            .map(|(i, _)| i)
+            .chain(lo)
+            .chain(hi)
+            .collect();
+        keep.sort_unstable();
+        keep.dedup();
+        out.extend(keep.into_iter().map(|i| chunk[i].clone()));
+    }
+    (out, true)
 }
 
 fn path_string(p: &Path) -> String {

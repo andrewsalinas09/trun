@@ -1,0 +1,6 @@
+title  = "Throughput"
+kind   = "stat"
+y      = "samples_per_s"
+reduce = "avg:10s"
+unit   = "samples/s"
+thresholds = [{ below = 800, color = "warn" }]

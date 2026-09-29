@@ -2,6 +2,7 @@
 
 mod client;
 mod daemon;
+mod emit;
 mod fmt;
 mod printer;
 
@@ -49,6 +50,14 @@ enum Cmd {
     },
     /// List projects
     Projects,
+    /// Report structure from inside a run (step-begin, step-end, progress, metric,
+    /// note, warn, error, info, heartbeat, expect). Writes to TRUN_EVENTS, or prints
+    /// the `::` line when not running under trun.
+    Emit {
+        verb: String,
+        #[arg(num_args = 0.., allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Open the web UI
     Ui {
         /// Open this run directly
@@ -78,6 +87,9 @@ struct RunArgs {
     /// Return immediately and print the run id instead of streaming output
     #[arg(short, long)]
     detach: bool,
+    /// Run under a pseudo-terminal (programs see a TTY; stdout and stderr merge)
+    #[arg(long)]
+    pty: bool,
     /// The command to run (after --)
     #[arg(last = true, required = true, num_args = 1..)]
     command: Vec<String>,
@@ -191,6 +203,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Cmd::Emit { verb, args } => emit::emit(&verb, &args),
         Cmd::Ui { run } => {
             let c = Client::connect(&paths, true).await?;
             let mut url = format!("{}/?t={}", c.base, c.token());
@@ -221,6 +234,8 @@ async fn hub(paths: &Paths, action: HubAction) -> Result<ExitCode> {
     match action {
         HubAction::Start { port, foreground } => {
             if foreground {
+                // Runs spawned by the hub must not inherit its log handles either.
+                daemon::disinherit_std_handles();
                 init_logging();
                 trun_hub::serve(trun_hub::HubConfig {
                     paths: paths.clone(),
@@ -309,6 +324,7 @@ async fn run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         name: args.name,
         project: args.project,
         env,
+        pty: args.pty,
     };
     let r: RunSummary = c.post("/runs", &req).await?;
 
@@ -510,6 +526,39 @@ async fn status(paths: &Paths, reference: &str) -> Result<ExitCode> {
             }
         }
         None => println!("diagnosis: –"),
+    }
+    if !r.steps.is_empty() {
+        println!("steps:");
+        for line in fmt::step_tree(&r.steps, now) {
+            println!("  {line}");
+        }
+    }
+    if !r.metrics.is_empty() {
+        println!("metrics (last):");
+        let width = r
+            .metrics
+            .keys()
+            .map(|k| k.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(24);
+        for (name, m) in r.metrics.iter().take(20) {
+            let step = m.step.map(|s| format!(" step {s}")).unwrap_or_default();
+            let nf = if m.non_finite > 0 {
+                format!(" · {} non-finite!", m.non_finite)
+            } else {
+                String::new()
+            };
+            println!(
+                "  {:<width$}  {:>12}{step} · {}{nf}",
+                fmt::truncate(name, 24),
+                fmt::num(m.value.0),
+                fmt::ago(m.ts)
+            );
+        }
+        if r.metrics.len() > 20 {
+            println!("  … {} more", r.metrics.len() - 20);
+        }
     }
     match r.last_output_at {
         Some(t) => println!("last output {} (seq {}):", fmt::ago(t), r.last_seq),

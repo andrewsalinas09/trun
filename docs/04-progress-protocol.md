@@ -83,30 +83,67 @@ named pipe on Windows. Writing newline-delimited JSON there emits events without
 touching stdout:
 
 ```json
-{"kind":"metric","values":{"loss":0.31},"step":1200}
-{"kind":"progress","id":"train","current":12,"total":50}
+{"kind":"metric","values":{"loss":0.31,"grad":"NaN"},"step":1200}
+{"kind":"progress","id":"train","current":12,"total":50,"unit":"epoch"}
+{"kind":"step_begin","id":"eval","name":"Evaluate","parent":null}
+{"kind":"step_end","id":"eval","status":"ok"}
+{"kind":"log","level":"warn","text":"disk nearly full"}
+{"kind":"note","text":"switching to schedule B"}
+{"kind":"heartbeat"}
+{"kind":"expect","silence_ms":1200000}
 ```
 
-Tiny helper libraries (Python, Rust, TypeScript) wrap this, but they are optional,
-because the format is trivial. If `TRUN_EVENTS` is unset (running outside trun), the
-helpers do nothing.
+JSON has no literal for NaN or infinity, so metric values may also be the strings
+`"NaN"`, `"inf"`, or `"-inf"`. They are stored and shown, never dropped. The side
+channel also accepts `::` protocol lines, which is how `trun emit` works.
+
+Endpoints: on Unix, a socket in a per-user 0700 directory
+(`$TMPDIR/trun-<uid>/<run>.sock`). On Windows, the named pipe
+`\\.\pipe\trun-<run id>`, whose default ACL admits only the owner, and remote
+clients are rejected.
+
+**Python helper:** [`sdk/python/trun.py`](../sdk/python/trun.py) is a single file
+using only the standard library: `trun.step()`, `progress()`, `metric()`, `note()`,
+`warn()`, `heartbeat()`, `expect_silence()`. Outside trun every call is a no-op, and
+a broken channel never raises into the program. Rust and TypeScript helpers are
+planned, but optional, because the format is trivial.
 
 ## Built-in parsers
 
-These are enabled automatically based on the command and output patterns, and can be
-turned off per task.
+These always run on every line. Each one only matches its own tool's output, so
+they don't need to be switched on. Per-task opt-out comes with task templates.
 
-| Parser | Recognizes | Emits |
-|---|---|---|
-| `tqdm` | tqdm/rich progress bars (including `\r` redraws) | progress, with rate and ETA |
-| `generic-fraction` | `N/M`, `[N/M]`, `N of M`, `NN%` at line start | progress (low confidence, used only when nothing better exists) |
-| `cargo` | `cargo build`/`test` output | steps per crate, per-test results, failures |
-| `pytest` | collection count, `PASSED`/`FAILED`, summary | progress, per-test results, failures |
-| `jest`/`vitest` | suite and test results | progress, failures |
-| `hf-trainer` | HuggingFace Trainer log dicts | metrics (loss, lr, epoch) |
-| `lightning` | PyTorch Lightning progress and metrics | progress, metrics |
-| `keras` | `Epoch n/N` and `loss: …` lines | progress, metrics |
-| `diagnosis` | tracebacks, `CUDA out of memory`, `Killed`, segfaults, `ModuleNotFoundError`, `No space left on device` | a diagnosis event with a classified cause |
+| Parser | Status | Recognizes | Emits |
+|---|---|---|---|
+| `tqdm` | ✅ M2 | tqdm bars with or without a total, `unit_scale` suffixes (`1.2M`), `s/it` rates, redrawn with `\r` | a step per bar description, progress, and the postfix (`loss=0.12`) as metrics |
+| `pytest` | ✅ M2 | activates on `=== test session starts ===`: collection count (including deselected), default and `-v` result lines, xdist, the final tally | a `tests` step with progress, `FAILED` lines as errors, and `tests_passed`/`tests_failed`/… metrics |
+| `cargo` | ✅ M2 | `Compiling`/`Checking`, the TTY `Building [..] n/m` bar, `Finished`, `error: could not compile`, a test binary per `Running`/`Doc-tests`, `test … ok/FAILED`, `test result:` | a `build` step with crate progress, a step per test binary with per-test progress, failures, and cumulative test counts |
+| `generic-fraction` | ✅ M2 | `N/M`, `[N/M]`, `N of M` at line start (`Epoch 3/10`, `[12/50] compiling`) | progress. Low confidence: only used while nothing more specific has reported progress for the run |
+| `jest`/`vitest` | planned | suite and test results | progress, failures |
+| `hf-trainer` | planned | HuggingFace Trainer log dicts | metrics (loss, lr, epoch) |
+| `lightning`, `keras` | planned | their progress and metric lines | progress, metrics |
+| `diagnosis` | ✅ M1 | tracebacks, `CUDA out of memory`, `Killed`, segfaults, `ModuleNotFoundError`, `No space left on device`, … | a diagnosis event with a classified cause |
+
+Built-in parsers see the line with ANSI escapes removed, including `\r`
+redraws (provisional lines), so a bar is tracked while it moves, not only when it
+finishes.
+
+### How structure becomes state
+
+The agent folds directives into the run summary (`steps`, `metrics`):
+
+- Progress without an `id` goes to the most recently begun open step, or to an
+  implicit `progress` step.
+- A step whose `current` reaches `total` completes automatically (`ok`). If
+  progress moves backwards (a bar restarts), the step reopens and its rate resets.
+- Ending a step ends its running children with the same status. When the run ends,
+  open steps close as `ok` (succeeded), `skipped` (cancelled), or `failed`.
+- Rate is an exponential moving average of units per second. ETA is
+  `(total − current) / rate`.
+- Progress updates are coalesced into at most one `progress` event per step every
+  250 ms. The summary always has the latest value.
+- The summary keeps at most 256 steps and 200 metric names. All metric points are
+  stored regardless.
 
 The diagnosis parser always runs. Its output feeds the run's final `diagnosis` field,
 so "why did it fail?" has a one-line answer.

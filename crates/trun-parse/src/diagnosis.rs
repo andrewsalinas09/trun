@@ -194,7 +194,8 @@ impl Diagnoser {
             return Some(Diagnosis {
                 cause: rule.cause.into(),
                 summary: format!("{}: {}", rule.label, clip(summary_line.text.trim(), 240)),
-                early,
+                // Failing tests are a result, not a failure to start.
+                early: early && !matches!(rule.cause, "test-failures" | "assertion"),
                 evidence,
             });
         }
@@ -275,9 +276,10 @@ impl Diagnoser {
             .or_else(|| self.tail.iter().rev().find(|l| !l.text.trim().is_empty()))
             .cloned();
         if let Some(l) = &line
-            && cause == "unknown" {
-                summary = format!("{summary}: {}", clip(l.text.trim(), 240));
-            }
+            && cause == "unknown"
+        {
+            summary = format!("{summary}: {}", clip(l.text.trim(), 240));
+        }
         Diagnosis {
             cause: cause.into(),
             summary,

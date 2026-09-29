@@ -1,0 +1,22 @@
+title   = "Training"
+applies = "train*"
+
+[[row]]
+panels = [
+  { panel = "builtin:diagnosis" },
+]
+
+[[row]]
+panels = [
+  { panel = "loss", span = 8 },
+  { panel = "throughput", span = 4 },
+]
+
+[[row]]
+panels = [
+  { panel = "builtin:steps", span = 6 },
+  { panel = "grad", span = 6 },
+]
+
+[[row]]
+panels = [{ panel = "builtin:log" }]

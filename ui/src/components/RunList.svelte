@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api, subscribe, Unauthorized } from "../lib/api";
-  import { ago, duration, elapsed } from "../lib/format";
+  import { ago, duration, elapsed, headline } from "../lib/format";
   import { now } from "../lib/now.svelte";
   import { TERMINAL, type RunSummary } from "../lib/types";
   import AuthNotice from "./AuthNotice.svelte";
@@ -72,6 +72,7 @@
         <tr>
           <th>Name</th>
           <th>State</th>
+          <th>Progress</th>
           <th>Project</th>
           <th>Host</th>
           <th class="num">Duration</th>
@@ -90,6 +91,13 @@
               {/if}
             </td>
             <td><StateBadge run={r} /></td>
+            <td class="progress">
+              {#if !TERMINAL.has(r.lifecycle) && headline(r)}
+                {@const h = headline(r)!}
+                <div class="pbar" title={h.label}>{#if h.pct != null}<span style:width="{h.pct}%"></span>{:else}<i></i>{/if}</div>
+                <div class="plabel muted">{h.label}</div>
+              {/if}
+            </td>
             <td class="muted">{r.project}</td>
             <td class="muted">{r.host}</td>
             <td class="num mono">{el == null ? "–" : duration(el)}</td>
@@ -177,6 +185,46 @@
   .empty {
     text-align: center;
     padding: 60px 0;
+  }
+  .progress {
+    width: 170px;
+  }
+  .pbar {
+    position: relative;
+    height: 5px;
+    border-radius: 3px;
+    background: var(--panel-2);
+    overflow: hidden;
+    margin-top: 6px;
+  }
+  .pbar span {
+    position: absolute;
+    inset: 0 auto 0 0;
+    background: var(--run);
+    transition: width 0.3s;
+  }
+  .pbar i {
+    position: absolute;
+    inset: 0;
+    width: 30%;
+    background: var(--run);
+    opacity: 0.5;
+    animation: slide 1.4s ease-in-out infinite;
+  }
+  @keyframes slide {
+    from {
+      left: -30%;
+    }
+    to {
+      left: 100%;
+    }
+  }
+  .plabel {
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 170px;
   }
   .error {
     color: var(--bad);

@@ -31,6 +31,17 @@ export function stateLabel(r: RunSummary): string {
   return r.lifecycle;
 }
 
+/** Progress of the most relevant running step, for list views. */
+export function headline(r: RunSummary): { pct: number | null; label: string } | null {
+  const s = [...(r.steps ?? [])].reverse().find((s) => s.state === "running" && s.current != null);
+  if (!s || s.current == null) return null;
+  if (s.total) {
+    const pct = Math.min(100, (s.current / s.total) * 100);
+    return { pct, label: `${s.name} ${pct.toFixed(0)}%` };
+  }
+  return { pct: null, label: `${s.name} ${s.current}${s.unit ? " " + s.unit : ""}` };
+}
+
 export function command(cmd: string[]): string {
   return cmd.map((a) => (a === "" || /[\s"']/.test(a) ? JSON.stringify(a) : a)).join(" ");
 }

@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 trun-proto.workspace = true
 trun-hub.workspace = true
+trun-parse.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 futures-util.workspace = true
@@ -30,3 +31,6 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Console"] }

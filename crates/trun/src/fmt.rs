@@ -33,8 +33,13 @@ pub fn state(r: &RunSummary) -> String {
                 s.push_str(&format!(" (exit {c})"));
             }
         }
-        Lifecycle::Running if r.health != trun_proto::Health::Ok => {
-            s.push_str(&format!(" · {}", r.health.as_str()));
+        Lifecycle::Running => {
+            if r.health != trun_proto::Health::Ok {
+                s.push_str(&format!(" · {}", r.health.as_str()));
+            }
+            if let Some(p) = headline_progress(&r.steps) {
+                s.push_str(&format!(" {p}"));
+            }
         }
         _ => {}
     }
@@ -50,6 +55,137 @@ pub fn symbol(l: Lifecycle) -> &'static str {
         Lifecycle::Cancelled => "■",
         Lifecycle::Lost | Lifecycle::Preempted => "?",
     }
+}
+
+/// Compact number: 4 significant digits, scientific for very small/large values.
+pub fn num(v: f64) -> String {
+    if v.is_nan() {
+        return "NaN".into();
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { "inf".into() } else { "-inf".into() };
+    }
+    let a = v.abs();
+    if v == v.trunc() && a < 1e12 {
+        format!("{v:.0}")
+    } else if !(1e-3..1e6).contains(&a) {
+        format!("{v:.3e}")
+    } else {
+        let s = format!("{v:.4}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+/// Round to 3 significant digits (rates don't need more).
+fn sig3(v: f64) -> f64 {
+    if v == 0.0 || !v.is_finite() {
+        return v;
+    }
+    let mag = 10f64.powi(2 - v.abs().log10().floor() as i32);
+    (v * mag).round() / mag
+}
+
+/// `23/50 epoch (46%) · 1.2/s · eta 21s`
+pub fn progress(s: &trun_proto::StepState) -> String {
+    let Some(cur) = s.current else {
+        return String::new();
+    };
+    let unit = s
+        .unit
+        .as_deref()
+        .map(|u| format!(" {u}"))
+        .unwrap_or_default();
+    let mut out = match s.total {
+        Some(t) if t > 0.0 => format!(
+            "{}/{}{unit} ({:.0}%)",
+            num(cur),
+            num(t),
+            (cur / t * 100.0).min(100.0)
+        ),
+        _ => format!("{}{unit}", num(cur)),
+    };
+    if s.state == trun_proto::StepRunState::Running {
+        if let Some(r) = s.rate.filter(|r| *r > 0.0) {
+            out.push_str(&format!(" · {}/s", num(sig3(r))));
+        }
+        if let Some(e) = s.eta_ms {
+            out.push_str(&format!(" · eta {}", duration(e)));
+        }
+    }
+    out
+}
+
+/// The step tree, indented by depth.
+pub fn step_tree(steps: &[trun_proto::StepState], now: Millis) -> Vec<String> {
+    use trun_proto::StepRunState as S;
+    fn depth(steps: &[trun_proto::StepState], s: &trun_proto::StepState) -> usize {
+        let mut d = 0;
+        let mut p = s.parent.as_deref();
+        while let Some(pid) = p {
+            d += 1;
+            p = steps
+                .iter()
+                .find(|x| x.id == pid)
+                .and_then(|x| x.parent.as_deref());
+            if d > 8 {
+                break;
+            }
+        }
+        d
+    }
+    // Parents first, children right after their parent, in begin order.
+    fn visit<'a>(
+        steps: &'a [trun_proto::StepState],
+        parent: Option<&str>,
+        out: &mut Vec<&'a trun_proto::StepState>,
+    ) {
+        for s in steps.iter().filter(|s| s.parent.as_deref() == parent) {
+            out.push(s);
+            visit(steps, Some(&s.id), out);
+        }
+    }
+    let mut ordered = Vec::new();
+    visit(steps, None, &mut ordered);
+    // Orphans (parent id unknown) at the end.
+    for s in steps {
+        if !ordered.iter().any(|o| o.id == s.id) {
+            ordered.push(s);
+        }
+    }
+    ordered
+        .into_iter()
+        .map(|s| {
+            let icon = match s.state {
+                S::Running => "▸",
+                S::Ok => "✓",
+                S::Failed => "✗",
+                S::Skipped => "–",
+            };
+            let took = duration(s.ended_at.unwrap_or(now) - s.started_at);
+            let indent = "  ".repeat(depth(steps, s));
+            format!(
+                "{indent}{icon} {:<24} {:>8}  {}",
+                truncate(&s.name, 24),
+                took,
+                progress(s)
+            )
+        })
+        .collect()
+}
+
+/// Progress of the most relevant running step, for list views: `46%` or `118 it`.
+pub fn headline_progress(steps: &[trun_proto::StepState]) -> Option<String> {
+    let s = steps
+        .iter()
+        .rev()
+        .find(|s| s.state == trun_proto::StepRunState::Running && s.current.is_some())?;
+    let cur = s.current?;
+    Some(match s.total {
+        Some(t) if t > 0.0 => format!("{:.0}%", (cur / t * 100.0).min(100.0)),
+        _ => format!("{} {}", num(cur), s.unit.as_deref().unwrap_or(""))
+            .trim_end()
+            .to_string(),
+    })
 }
 
 pub fn command(cmd: &[String]) -> String {

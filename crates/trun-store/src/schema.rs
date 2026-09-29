@@ -50,6 +50,18 @@ const PROJECT_MIGRATIONS: &[&str] = &[
         payload TEXT NOT NULL,
         PRIMARY KEY (run_id, seq)
      ) STRICT, WITHOUT ROWID;",
+    // v2: metric points. SQLite turns NaN into NULL, so non-finite values are kept
+    // in `special` (1 = NaN, 2 = +inf, 3 = -inf) with `value` NULL.
+    "CREATE TABLE metrics (
+        run_id  TEXT NOT NULL,
+        name    TEXT NOT NULL,
+        seq     INTEGER NOT NULL,
+        ts      INTEGER NOT NULL,
+        step    INTEGER,
+        value   REAL,
+        special INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (run_id, name, seq)
+     ) STRICT, WITHOUT ROWID;",
 ];
 
 pub fn migrate_hub(conn: &Connection) -> Result<()> {

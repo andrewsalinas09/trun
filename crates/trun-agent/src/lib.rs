@@ -1,11 +1,17 @@
 //! The agent owns the runs on one host (docs/02-architecture.md).
 //!
-//! In M1 the agent is embedded in the hub process; the event flow is already the
-//! one remote agents will use: every event gets a per-run `seq`, is kept in a
-//! bounded in-memory ring for live subscribers, broadcast, and appended to the store.
+//! It is embedded in the hub process for now; the event flow is already the one
+//! remote agents will use: every event gets a per-run `seq`, is kept in a bounded
+//! in-memory ring for live subscribers, broadcast, and appended to the store.
+//!
+//! Per run: output lines go through the parsers (`::` protocol + built-ins), the
+//! side channel feeds directives directly, and [`structure::Structure`] turns
+//! directives into steps, progress rates, and latest metrics.
 
 mod naming;
 pub mod project;
+mod sidechannel;
+mod structure;
 
 use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
@@ -13,11 +19,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot};
-use trun_parse::{Diagnoser, ExitInfo};
-use trun_proto::{CreateRun, Event, EventKind, Health, Lifecycle, RunSummary, Stream, now_ms};
+use tokio::sync::{broadcast, mpsc};
+use trun_parse::{Diagnoser, ExitInfo, ParserSet};
+use trun_proto::{
+    CreateRun, Directive, Event, EventKind, Health, Lifecycle, LogLevel, RunSummary, Stream, now_ms,
+};
 use trun_store::Store;
 use trun_supervise::{ExitStatusInfo, Killer, SpawnSpec};
+
+use sidechannel::SideMsg;
+use structure::Structure;
 
 /// Events kept in memory per active run, for subscribers joining mid-stream.
 const RING_CAP: usize = 4096;
@@ -28,8 +39,10 @@ const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
 /// Finished runs stay in memory this long so late subscribers get a seamless replay.
 const RETAIN_FINISHED: Duration = Duration::from_secs(60);
-/// How often an active run republishes its summary (last output time, seq).
-const SUMMARY_PUBLISH_EVERY: Duration = Duration::from_secs(2);
+/// How often an active run republishes its summary (progress, metrics, activity).
+const SUMMARY_PUBLISH_EVERY: Duration = Duration::from_secs(1);
+/// Coalesced progress events go out on this tick.
+const PROGRESS_TICK: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub struct Agent {
@@ -53,8 +66,24 @@ pub struct RunHandle {
 
 struct RunState {
     summary: RunSummary,
+    structure: Structure,
     ring: VecDeque<Arc<Event>>,
     next_seq: u64,
+}
+
+impl RunState {
+    /// The summary with the latest derived structure folded in.
+    fn snapshot(&self) -> RunSummary {
+        let mut s = self.summary.clone();
+        s.steps = self.structure.steps.clone();
+        s.metrics = self.structure.metrics.clone();
+        s.expect_silence_ms = self.structure.expect_silence_ms;
+        s.last_activity_at = [s.last_output_at, self.structure.last_activity_at]
+            .into_iter()
+            .flatten()
+            .max();
+        s
+    }
 }
 
 /// What a new subscriber gets: events still in memory, then the live feed.
@@ -96,10 +125,14 @@ impl Agent {
         self.inner.fleet.subscribe()
     }
 
+    fn handle(&self, id: &str) -> Option<Arc<RunHandle>> {
+        self.inner.runs.lock().unwrap().get(id).cloned()
+    }
+
     /// Live summary for a run held in memory (active or recently finished).
     pub fn summary(&self, id: &str) -> Option<RunSummary> {
-        let h = self.inner.runs.lock().unwrap().get(id).cloned()?;
-        let s = h.state.lock().unwrap().summary.clone();
+        let h = self.handle(id)?;
+        let s = h.state.lock().unwrap().snapshot();
         Some(s)
     }
 
@@ -108,12 +141,12 @@ impl Agent {
             self.inner.runs.lock().unwrap().values().cloned().collect();
         handles
             .iter()
-            .map(|h| h.state.lock().unwrap().summary.clone())
+            .map(|h| h.state.lock().unwrap().snapshot())
             .collect()
     }
 
     pub fn subscribe(&self, id: &str, since_seq: u64) -> Option<Subscription> {
-        let h = self.inner.runs.lock().unwrap().get(id).cloned()?;
+        let h = self.handle(id)?;
         // Holding the state lock while subscribing guarantees no event slips between
         // the backlog snapshot and the live receiver (emit also holds this lock).
         let st = h.state.lock().unwrap();
@@ -143,7 +176,7 @@ impl Agent {
         if !cwd.is_dir() {
             anyhow::bail!("working directory does not exist: {}", req.cwd);
         }
-        let project = project::resolve_project(req.project.as_deref(), &cwd);
+        let resolved = project::resolve(req.project.as_deref(), &cwd);
         let name = req
             .name
             .clone()
@@ -152,7 +185,7 @@ impl Agent {
         let id = ulid::Ulid::new().to_string();
         let summary = RunSummary {
             id: id.clone(),
-            project,
+            project: resolved.name,
             name,
             host: self.inner.host.clone(),
             cmd: req.cmd.clone(),
@@ -160,19 +193,15 @@ impl Agent {
             lifecycle: Lifecycle::Starting,
             health: Health::Ok,
             created_at: now_ms(),
-            started_at: None,
-            ended_at: None,
-            exit_code: None,
-            signal: None,
-            pid: None,
-            diagnosis: None,
-            last_seq: 0,
-            last_output_at: None,
+            config_root: resolved.root.map(|r| r.to_string_lossy().into_owned()),
+            pty: req.pty,
+            ..Default::default()
         };
         let (live, _) = broadcast::channel(RING_CAP);
         let handle = Arc::new(RunHandle {
             state: Mutex::new(RunState {
                 summary: summary.clone(),
+                structure: Structure::default(),
                 ring: VecDeque::new(),
                 next_seq: 1,
             }),
@@ -196,7 +225,7 @@ impl Agent {
 
     /// Request cancellation. Returns false if the run is unknown or already finished.
     pub fn cancel(&self, id: &str, force: bool) -> bool {
-        let Some(h) = self.inner.runs.lock().unwrap().get(id).cloned() else {
+        let Some(h) = self.handle(id) else {
             return false;
         };
         if h.state.lock().unwrap().summary.lifecycle.is_terminal() {
@@ -226,6 +255,12 @@ impl Agent {
             tracing::error!(run = %summary.id, error = %e, "failed to persist run summary");
         }
         let _ = self.inner.fleet.send(summary.clone());
+    }
+
+    fn publish_snapshot(&self, h: &RunHandle) -> RunSummary {
+        let s = h.state.lock().unwrap().snapshot();
+        self.publish(&s);
+        s
     }
 
     /// Append an event: sequence it, ring it, broadcast it, persist it.
@@ -260,14 +295,20 @@ impl Agent {
         seq
     }
 
+    /// Apply a directive to the run's structure and emit resulting events.
+    fn apply(&self, h: &RunHandle, d: Directive) {
+        let kinds = h.state.lock().unwrap().structure.apply(d, now_ms());
+        for k in kinds {
+            self.emit(h, k);
+        }
+    }
+
     fn update_summary(&self, h: &RunHandle, f: impl FnOnce(&mut RunSummary)) -> RunSummary {
-        let s = {
+        {
             let mut st = h.state.lock().unwrap();
             f(&mut st.summary);
-            st.summary.clone()
-        };
-        self.publish(&s);
-        s
+        }
+        self.publish_snapshot(h)
     }
 
     async fn drive(&self, h: Arc<RunHandle>, req: CreateRun) {
@@ -275,11 +316,25 @@ impl Agent {
             let st = h.state.lock().unwrap();
             (st.summary.id.clone(), st.summary.project.clone())
         };
+
+        // Side channel first, so its endpoint can go into the child's environment.
+        let (side_tx, mut side_rx) = mpsc::channel::<SideMsg>(1024);
+        let side = match sidechannel::open(&run_id, side_tx) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(run = %run_id, error = %e, "could not open the TRUN_EVENTS side channel");
+                None
+            }
+        };
+
         let mut env: Vec<(String, String)> = vec![
             ("TRUN_RUN_ID".into(), run_id.clone()),
             ("TRUN_PROJECT".into(), project),
             ("TRUN_HUB".into(), self.inner.hub_url.clone()),
         ];
+        if let Some(s) = &side {
+            env.push(("TRUN_EVENTS".into(), s.endpoint.clone()));
+        }
         // Unbuffered Python output is the single most common "why is it silent?" fix.
         if std::env::var_os("PYTHONUNBUFFERED").is_none()
             && !req.env.iter().any(|(k, _)| k == "PYTHONUNBUFFERED")
@@ -291,11 +346,12 @@ impl Agent {
             cmd: req.cmd.clone(),
             cwd: PathBuf::from(&req.cwd),
             env,
+            pty: req.pty,
         };
 
         let started = std::time::Instant::now();
-        let (mut proc, stdout, stderr) = match trun_supervise::spawn(&spec) {
-            Ok(x) => x,
+        let proc = match trun_supervise::start(&spec) {
+            Ok(p) => p,
             Err(e) => {
                 let exit = ExitInfo {
                     spawn_error: Some(e.to_string()),
@@ -311,8 +367,8 @@ impl Agent {
                 return;
             }
         };
-        let pid = proc.pid();
-        *h.killer.lock().unwrap() = Some(proc.killer());
+        let pid = proc.pid;
+        *h.killer.lock().unwrap() = Some(proc.killer.clone());
         self.emit(
             &h,
             EventKind::Lifecycle {
@@ -328,36 +384,51 @@ impl Agent {
             s.started_at = Some(now_ms());
             s.pid = Some(pid);
         });
-        tracing::info!(run = %run_id, pid, cmd = ?req.cmd, "run started");
+        tracing::info!(run = %run_id, pid, cmd = ?req.cmd, pty = req.pty, "run started");
 
         let (line_tx, mut line_rx) = mpsc::channel(1024);
-        let p_out = tokio::spawn(trun_supervise::pump(
-            stdout,
+        let mut pumps = vec![tokio::spawn(trun_supervise::pump(
+            proc.stdout,
             Stream::Stdout,
             line_tx.clone(),
-        ));
-        let p_err = tokio::spawn(trun_supervise::pump(stderr, Stream::Stderr, line_tx));
+        ))];
+        if let Some(stderr) = proc.stderr {
+            pumps.push(tokio::spawn(trun_supervise::pump(
+                stderr,
+                Stream::Stderr,
+                line_tx,
+            )));
+        } else {
+            drop(line_tx);
+        }
+        let mut exit_rx = proc.exit;
 
-        let (status_tx, mut status_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let _ = status_tx.send(proc.wait().await);
-        });
-
+        let mut parsers = ParserSet::new();
         let mut diagnoser = Diagnoser::default();
         let mut status: Option<ExitStatusInfo> = None;
         let mut drain_deadline: Option<tokio::time::Instant> = None;
         let mut publish_tick = tokio::time::interval(SUMMARY_PUBLISH_EVERY);
+        let mut progress_tick = tokio::time::interval(PROGRESS_TICK);
         let mut published_seq = 0;
         let mut lines_open = true;
+        let mut side_open = side.is_some();
+        let mut invalid_side = 0u32;
 
         loop {
             tokio::select! {
                 line = line_rx.recv(), if lines_open => match line {
                     Some(l) => {
-                        let clean = trun_parse::strip_ansi(&l.text).into_owned();
-                        let seq = self.emit(&h, EventKind::Output { stream: l.stream, text: l.text, cr: l.cr });
-                        if !l.cr {
-                            diagnoser.push(seq, &clean);
+                        let feed = parsers.feed(&l.text, l.cr);
+                        if !feed.hide {
+                            let clean = trun_parse::strip_ansi(&l.text).into_owned();
+                            let text = trun_parse::sanitize_display(&l.text).into_owned();
+                            let seq = self.emit(&h, EventKind::Output { stream: l.stream, text, cr: l.cr });
+                            if !l.cr {
+                                diagnoser.push(seq, &clean);
+                            }
+                        }
+                        for d in feed.directives {
+                            self.apply(&h, d);
                         }
                     }
                     None => {
@@ -365,12 +436,27 @@ impl Agent {
                         if status.is_some() { break; }
                     }
                 },
-                r = &mut status_rx, if status.is_none() => {
+                msg = side_rx.recv(), if side_open => match msg {
+                    Some(SideMsg::Directive(d)) => {
+                        parsers.note_external(&d);
+                        self.apply(&h, d);
+                    }
+                    Some(SideMsg::Invalid(why)) => {
+                        // Report the first few, then stay quiet: a broken emitter
+                        // must not flood the log.
+                        invalid_side += 1;
+                        if invalid_side <= 5 {
+                            self.emit(&h, EventKind::Log { level: LogLevel::Warn, text: format!("trun: bad TRUN_EVENTS message: {why}") });
+                        }
+                    }
+                    None => side_open = false,
+                },
+                r = &mut exit_rx, if status.is_none() => {
                     let st = match r {
                         Ok(Ok(st)) => st,
                         Ok(Err(e)) => {
                             tracing::error!(run = %run_id, error = %e, "wait failed");
-                            ExitStatusInfo { code: None, signal: None }
+                            ExitStatusInfo::default()
                         }
                         Err(_) => ExitStatusInfo::default(),
                     };
@@ -379,21 +465,36 @@ impl Agent {
                     drain_deadline = Some(tokio::time::Instant::now() + PIPE_DRAIN_GRACE);
                 }
                 _ = async { tokio::time::sleep_until(drain_deadline.unwrap()).await }, if drain_deadline.is_some() => {
-                    tracing::debug!(run = %run_id, "pipes still open after exit (leftover child processes); stop reading");
+                    tracing::debug!(run = %run_id, "output still open after exit (leftover child processes); stop reading");
                     break;
                 }
+                _ = progress_tick.tick() => {
+                    let kinds = h.state.lock().unwrap().structure.flush_progress(now_ms());
+                    for k in kinds {
+                        self.emit(&h, k);
+                    }
+                }
                 _ = publish_tick.tick() => {
-                    let seq = h.state.lock().unwrap().summary.last_seq;
-                    if seq != published_seq {
-                        published_seq = seq;
-                        let s = h.state.lock().unwrap().summary.clone();
-                        self.publish(&s);
+                    let (seq, activity) = {
+                        let st = h.state.lock().unwrap();
+                        (st.summary.last_seq, st.structure.last_activity_at)
+                    };
+                    let marker = seq.wrapping_add(activity.unwrap_or(0) as u64);
+                    if marker != published_seq {
+                        published_seq = marker;
+                        self.publish_snapshot(&h);
                     }
                 }
             }
         }
-        p_out.abort();
-        p_err.abort();
+        for p in pumps {
+            p.abort();
+        }
+        // Late side-channel messages (e.g. a final metric) that already arrived.
+        while let Ok(SideMsg::Directive(d)) = side_rx.try_recv() {
+            self.apply(&h, d);
+        }
+        drop(side);
 
         let status = status.unwrap_or_default();
         let cancelled = h.cancel_requested.load(Ordering::SeqCst);
@@ -424,6 +525,15 @@ impl Agent {
         diagnosis: Option<trun_proto::Diagnosis>,
         reason: Option<String>,
     ) {
+        let closing = h
+            .state
+            .lock()
+            .unwrap()
+            .structure
+            .finalize(lifecycle, now_ms());
+        for k in closing {
+            self.emit(h, k);
+        }
         if let Some(d) = &diagnosis {
             self.emit(h, EventKind::Diagnosis(d.clone()));
         }

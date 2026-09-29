@@ -216,7 +216,8 @@ SQLite file per project** holding its runs, events, logs, metrics, alerts, notes
 and per-run host samples. The project is resolved from `--project`, then
 `.trun/config.toml`, then the git remote or root name, falling back to `_adhoc`.
 **Consequences:** A project's history is portable as one file, and retention and
-deletion are per project.
+deletion are per project. Cross-project views go through the run index in `hub.db`.
+DuckDB can still read the files as an optional, external analysis tool.
 
 ## D21 · Local clients talk to the hub over loopback HTTP with a token (2026-09-28)
 
@@ -232,5 +233,46 @@ rebinding.
 API without the token. The CLI auto-starts the hub as a detached process (setsid on
 Unix; on Windows DETACHED_PROCESS plus breakaway from the caller's job, so a harness
 killing its job doesn't take the hub with it).
- Cross-project views go through the run index in `hub.db`.
-DuckDB can still read the files as an optional, external analysis tool.
+
+## D22 · Own ConPTY driver on Windows, with passthrough and a normalizer (2026-09-29)
+
+**Context:** `--pty` on Windows via portable-pty hung every run. Its hardcoded
+`PSEUDOCONSOLE_INHERIT_CURSOR` makes ConPTY ask the absent terminal for the cursor
+position. It also can't enable passthrough. Without passthrough, ConPTY re-renders
+its screen and emits cursor-positioning diffs instead of the program's `\r` and `\n`,
+so line parsing saw glued-together redraws.
+**Decision:** On Windows, trun drives ConPTY directly (`trun-supervise/src/conpty.rs`).
+It requests `PSEUDOCONSOLE_PASSTHROUGH_MODE` (raw program output where the OS
+supports it) and never inherit-cursor. It passes an explicit application path and
+invalid std handles (so the child can't grab the hub's log). It answers terminal
+queries itself (DSR, DA1). A normalizer maps rendered-mode positioning back to
+`\r`/`\n` and drops screen clears. Unix keeps portable-pty, because openpty is
+transparent. `TRUN_PTY_TRACE=<file>` dumps raw pseudo-console bytes for debugging.
+**Consequences:** tqdm under `--pty` parses the same on Windows as on Linux. A full
+terminal emulator was avoided. If a program relies on complex full-screen redraws,
+its log is approximate, but its structure (steps, progress) is still extracted.
+
+## D23 · On Windows the hub runs from a copy; outdated hubs restart (2026-09-29)
+
+**Context:** Windows locks a running .exe. A background hub started from `trun.exe`
+blocked rebuilding or upgrading trun, and a stale hub kept serving old code.
+**Decision:** The auto-started hub runs from `$TRUN_HOME/bin/trun-hub-<size>-<mtime>.exe`,
+and old copies are cleaned up. `/api/health` reports a `build` id (size and mtime,
+which a copy preserves). When the CLI finds a different build, it restarts the hub
+if no runs are active. Otherwise it prints a note.
+**Consequences:** Upgrading trun just works. Unix uses the binary in place, because
+a running file can be replaced there.
+
+## D24 · No handle leaks into background processes (2026-09-29)
+
+**Context:** `CreateProcess` passes every inheritable handle to the child. The
+auto-started hub inherited the CLI's stdout pipe and held it open forever, so
+`$(trun run …)`, `trun … | cat`, or an agent harness capturing output hung waiting
+for EOF.
+**Decision:** Before spawning the hub, the CLI marks its std handles
+non-inheritable. The hub does the same for itself, so runs don't inherit its log
+file. The client also checks that the hub on the port accepts *its* token and
+explains when a hub from another `TRUN_HOME` holds the port. A `hub stop` gives open
+SSE connections 2 s, then exits.
+**Consequences:** trun is safe to call from any capturing context, which is the
+normal case for AI agents.

@@ -1,0 +1,4 @@
+title   = "Gradient norm (log scale)"
+kind    = "area"
+y       = "grad_norm"
+scale.y = "log"

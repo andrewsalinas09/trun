@@ -22,3 +22,6 @@ mime_guess.workspace = true
 regex.workspace = true
 rand.workspace = true
 dirs.workspace = true
+trun-parse.workspace = true
+notify = "8"
+toml = "0.9"

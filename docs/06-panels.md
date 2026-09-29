@@ -14,6 +14,25 @@ There are two tiers:
 
 Nothing is compiled into the binary. Edits appear live.
 
+## Implementation status (M2)
+
+| Feature | Status |
+|---|---|
+| TOML panels, validated strictly (unknown keys are errors, reported per file with line and column) | ✅ |
+| Kinds: `line`, `area`, `scatter`, `bar` (latest value per metric), `stat` (with `reduce` and `thresholds`), `table` | ✅ |
+| `heatmap`, `histogram`, `gallery`, `log` kinds | planned |
+| `source = "metric"` | ✅ |
+| Other sources (`progress`, `sample`, `alert`, `artifact`) | planned (M3/M4/M7) |
+| `x` = `step` / `time` / `elapsed`, `smooth`, `scale.y` = `log` | ✅ |
+| `runs = "current"` | ✅ |
+| Comparing runs | planned (M6) |
+| Dashboards: `applies` glob, 12-column rows, `span`, `height`, builtins `builtin:{diagnosis,steps,metrics,log}` | ✅ |
+| Hot reload: debounced file watcher → SSE `/api/runs/:id/panels/stream`. Measured latency is about 100 ms | ✅ |
+| TypeScript panels | planned (M6). A `.ts` file is listed with an explanatory error |
+| NaN and inf values drawn as red dashed rules on charts | ✅ |
+
+A worked example is in [`examples/training/.trun/`](../examples/training/.trun).
+
 ## Built-in views (no files needed)
 
 Every run automatically gets:

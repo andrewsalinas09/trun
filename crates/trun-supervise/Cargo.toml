@@ -1,6 +1,6 @@
 [package]
 name = "trun-supervise"
-description = "Process supervision for trun: spawn, capture output, kill process trees"
+description = "Process supervision for trun: spawn (pipes or pty), capture output, kill process trees"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,11 +8,20 @@ license.workspace = true
 [dependencies]
 trun-proto.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tracing.workspace = true
 which = "8"
+tokio-util = { version = "0.7", features = ["io"] }
+bytes = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+portable-pty = "0.9"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
