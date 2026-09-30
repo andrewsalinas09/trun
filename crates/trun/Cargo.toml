@@ -25,6 +25,7 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 open = "5"
+gethostname = "1"
 bytes = "1"
 
 [target.'cfg(unix)'.dependencies]

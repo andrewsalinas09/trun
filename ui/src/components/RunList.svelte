@@ -5,6 +5,7 @@
   import { TERMINAL, type RunSummary } from "../lib/types";
   import AuthNotice from "./AuthNotice.svelte";
   import StateBadge from "./StateBadge.svelte";
+  import Hosts from "./Hosts.svelte";
 
   let runs = $state<Record<string, RunSummary>>({});
   let project = $state("");
@@ -44,6 +45,7 @@
 {#if unauthorized}
   <AuthNotice />
 {:else}
+  <Hosts />
   <div class="toolbar">
     <h1>Runs</h1>
     <span class="muted">{activeCount} active</span>

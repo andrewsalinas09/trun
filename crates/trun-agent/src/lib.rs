@@ -94,6 +94,8 @@ pub struct RunHandle {
 }
 
 struct RunState {
+    /// Mirrored from a remote host: the summary arrives complete from there.
+    remote: bool,
     summary: RunSummary,
     structure: Structure,
     /// What checks see; fed by every emitted event plus samples.
@@ -105,6 +107,9 @@ struct RunState {
 impl RunState {
     /// The summary with the latest derived structure folded in.
     fn snapshot(&self) -> RunSummary {
+        if self.remote {
+            return self.summary.clone();
+        }
         let mut s = self.summary.clone();
         s.steps = self.structure.steps.clone();
         s.metrics = self.structure.metrics.clone();
@@ -161,7 +166,7 @@ impl Agent {
             .filter_map(|h| {
                 let st = h.state.lock().unwrap();
                 let s = &st.summary;
-                (s.lifecycle == Lifecycle::Running).then_some(())?;
+                (s.lifecycle == Lifecycle::Running && !st.remote).then_some(())?;
                 let pid = s.pid?;
                 let cwd = s.cwd.clone();
                 drop(st);
@@ -230,6 +235,21 @@ impl Agent {
         if req.cmd.is_empty() {
             anyhow::bail!("empty command");
         }
+        // `~` (and an empty cwd) mean the home directory: remote callers can't
+        // know this host's paths.
+        let mut req = req;
+        if (req.cwd.is_empty()
+            || req.cwd == "~"
+            || req.cwd.starts_with("~/")
+            || req.cwd.starts_with("~\\"))
+            && let Some(home) = dirs::home_dir()
+        {
+            let rest = req
+                .cwd
+                .trim_start_matches('~')
+                .trim_start_matches(['/', '\\']);
+            req.cwd = home.join(rest).to_string_lossy().into_owned();
+        }
         let cwd = PathBuf::from(&req.cwd);
         if !cwd.is_dir() {
             anyhow::bail!("working directory does not exist: {}", req.cwd);
@@ -258,6 +278,7 @@ impl Agent {
         let (live, _) = broadcast::channel(RING_CAP);
         let handle = Arc::new(RunHandle {
             state: Mutex::new(RunState {
+                remote: false,
                 summary: summary.clone(),
                 structure: Structure::default(),
                 data: {
@@ -312,6 +333,155 @@ impl Agent {
             }
         }
         true
+    }
+
+    // ---- mirrored remote runs (docs/07-remote.md) ----
+
+    /// Create or update the mirror of a remote run. Its events arrive separately
+    /// through [`Agent::mirror_event`].
+    pub fn mirror_summary(&self, via: &str, mut s: RunSummary) {
+        s.via = Some(via.to_string());
+        let existing = self.handle(&s.id);
+        let h = match existing {
+            Some(h) => h,
+            None => {
+                let (live, _) = broadcast::channel(RING_CAP);
+                let h = Arc::new(RunHandle {
+                    state: Mutex::new(RunState {
+                        remote: true,
+                        summary: s.clone(),
+                        structure: Structure::default(),
+                        data: trun_checks::RunData::new(&s.id, &s.name, &s.project),
+                        ring: VecDeque::new(),
+                        next_seq: s.last_seq + 1,
+                    }),
+                    live,
+                    killer: Mutex::new(None),
+                    cancel_requested: AtomicBool::new(false),
+                    killed_by_check: Mutex::new(None),
+                });
+                self.inner
+                    .runs
+                    .lock()
+                    .unwrap()
+                    .insert(s.id.clone(), h.clone());
+                h
+            }
+        };
+        let finished = s.lifecycle.is_terminal();
+        {
+            let mut st = h.state.lock().unwrap();
+            // A summary that lags the events must not un-finish a run whose terminal
+            // lifecycle event was already applied (see `mirror_event`).
+            if st.summary.lifecycle.is_terminal() && !s.lifecycle.is_terminal() {
+                return;
+            }
+            // `last_seq` stays the remote's: it marks the event the summary's
+            // content is consistent with, and clients resume the stream from there.
+            st.summary = s;
+        }
+        let snap = h.state.lock().unwrap().snapshot();
+        self.publish(&snap);
+        if finished {
+            let agent = self.clone();
+            let id = snap.id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(RETAIN_FINISHED).await;
+                let still_done = agent
+                    .handle(&id)
+                    .is_some_and(|h| h.state.lock().unwrap().summary.lifecycle.is_terminal());
+                if still_done {
+                    agent.inner.runs.lock().unwrap().remove(&id);
+                }
+            });
+        }
+    }
+
+    /// Append an event received from a remote host, keeping its sequence number.
+    /// Duplicates (a replay after reconnecting) are ignored.
+    pub fn mirror_event(&self, ev: Event) {
+        let Some(h) = self.handle(&ev.run_id) else {
+            return;
+        };
+        let mut st = h.state.lock().unwrap();
+        if !st.remote || st.ring.back().is_some_and(|last| last.seq >= ev.seq) {
+            return;
+        }
+        let ev = Arc::new(ev);
+        st.next_seq = st.next_seq.max(ev.seq + 1);
+        // Summaries travel on a separate stream and can lag the events, so apply the
+        // events that decide how a run ended here, and before `live.send`: a stream
+        // that sees the terminal event reads the summary for its `end` right away.
+        let mut changed = false;
+        match &ev.kind {
+            EventKind::Output { .. } => st.summary.last_output_at = Some(ev.ts),
+            EventKind::Lifecycle {
+                state,
+                exit_code,
+                signal,
+                pid,
+                ..
+            } => {
+                let s = &mut st.summary;
+                s.lifecycle = *state;
+                s.exit_code = exit_code.or(s.exit_code);
+                s.signal = signal.or(s.signal);
+                s.pid = pid.or(s.pid);
+                if state.is_terminal() {
+                    s.ended_at = Some(ev.ts);
+                }
+                changed = true;
+            }
+            EventKind::Diagnosis(d) => {
+                st.summary.diagnosis = Some(d.clone());
+                changed = true;
+            }
+            _ => {}
+        }
+        if st.ring.len() == RING_CAP {
+            st.ring.pop_front();
+        }
+        st.ring.push_back(ev.clone());
+        let _ = h.live.send(ev.clone());
+        if let Err(e) = self
+            .inner
+            .store
+            .append_events(&st.summary.project, vec![(*ev).clone()])
+        {
+            tracing::error!(error = %e, "failed to persist mirrored event");
+        }
+        if changed {
+            let snap = st.snapshot();
+            drop(st);
+            self.publish(&snap);
+        }
+    }
+
+    /// The host link a run is mirrored from, if it is a remote run in memory.
+    pub fn remote_of(&self, id: &str) -> Option<String> {
+        let h = self.handle(id)?;
+        let st = h.state.lock().unwrap();
+        if st.remote {
+            st.summary.via.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Mirrored runs of a host that are still active (for connection-loss marking).
+    pub fn mirrored_active(&self, via: &str) -> Vec<RunSummary> {
+        let handles: Vec<Arc<RunHandle>> =
+            self.inner.runs.lock().unwrap().values().cloned().collect();
+        handles
+            .iter()
+            .filter_map(|h| {
+                let st = h.state.lock().unwrap();
+                (st.remote
+                    && st.summary.via.as_deref() == Some(via)
+                    && !st.summary.lifecycle.is_terminal())
+                .then(|| st.summary.clone())
+            })
+            .collect()
     }
 
     fn publish(&self, summary: &RunSummary) {

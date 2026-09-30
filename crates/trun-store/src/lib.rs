@@ -441,7 +441,9 @@ impl Store {
         })?;
         let now = now_ms();
         let mut out = Vec::new();
-        for mut r in orphans {
+        // Mirrored remote runs are owned by their host's daemon, not this hub; they
+        // resync when the host link reconnects.
+        for mut r in orphans.into_iter().filter(|r| r.via.is_none()) {
             r.lifecycle = Lifecycle::Lost;
             r.ended_at = Some(now);
             self.upsert_run(&r)?;
@@ -449,6 +451,46 @@ impl Store {
         }
         self.flush();
         Ok(out)
+    }
+
+    /// Highest event sequence actually stored for a run (0 if none). Replication
+    /// resumes from here; a summary's `last_seq` may be ahead of stored events.
+    pub fn max_event_seq(&self, project: &str, run_id: &str) -> Result<u64> {
+        let Some(conn) = self.project_ro(project)? else {
+            return Ok(0);
+        };
+        let max: Option<i64> = conn.query_row(
+            "SELECT MAX(m) FROM (SELECT MAX(seq) AS m FROM output WHERE run_id = ?1
+                                 UNION ALL SELECT MAX(seq) FROM events WHERE run_id = ?1)",
+            [run_id],
+            |r| r.get(0),
+        )?;
+        Ok(max.unwrap_or(0) as u64)
+    }
+
+    // ---- remote hosts (hub.db) ----
+
+    pub fn hosts(&self) -> Result<Vec<trun_proto::HostConfig>> {
+        let conn = self.hub_ro()?;
+        let mut stmt = conn.prepare("SELECT config FROM hosts ORDER BY name")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
+    }
+
+    /// Insert or replace a host (synchronous: config changes are rare).
+    pub fn put_host(&self, h: &trun_proto::HostConfig) -> Result<()> {
+        let conn = open_rw(&self.inner.data_dir.join("hub.db"))?;
+        conn.execute(
+            "INSERT INTO hosts (name, config, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET config = excluded.config",
+            params![h.name, serde_json::to_string(h)?, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_host(&self, name: &str) -> Result<bool> {
+        let conn = open_rw(&self.inner.data_dir.join("hub.db"))?;
+        Ok(conn.execute("DELETE FROM hosts WHERE name = ?1", [name])? > 0)
     }
 }
 

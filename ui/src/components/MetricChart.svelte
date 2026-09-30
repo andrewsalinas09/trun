@@ -81,7 +81,13 @@
         .filter((r): r is { name: string; v: number } => r != null);
       marks.push(Plot.barY(last, { x: "name", y: "v", fill: multi ? "name" : "var(--accent)", tip: true }));
     } else {
-      if (kind === "area") marks.push(Plot.areaY(rows, { x: "x", y: "v", fill: stroke, fillOpacity: 0.15 }));
+      if (kind === "area") {
+        // An area's default baseline is y=0, which a log scale maps to -Infinity; d3's
+        // log ticks then never terminate and freeze the page. Fill down to the smallest
+        // plotted value instead.
+        const floor = logY && rows.length ? Math.min(...rows.map((r) => r.v)) : 0;
+        marks.push(Plot.areaY(rows, { x: "x", y1: floor, y2: "v", fill: stroke, fillOpacity: 0.15 }));
+      }
       if (kind === "scatter") {
         marks.push(Plot.dot(rows, { x: "x", y: "v", stroke, r: 2 }));
       } else {

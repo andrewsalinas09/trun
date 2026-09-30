@@ -136,6 +136,41 @@ impl Client {
         .await
     }
 
+    /// POST a JSON body; only the status matters.
+    pub async fn post_status<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
+        let res = self
+            .req(reqwest::Method::POST, path)
+            .json(body)
+            .send()
+            .await?;
+        Self::check(res).await
+    }
+
+    pub async fn delete(&self, path: &str) -> Result<()> {
+        let res = self.req(reqwest::Method::DELETE, path).send().await?;
+        Self::check(res).await
+    }
+
+    async fn check(res: reqwest::Response) -> Result<()> {
+        let status = res.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = res.text().await.unwrap_or_default();
+        let msg = serde_json::from_str::<ApiError>(&body)
+            .map(|e| e.error)
+            .unwrap_or(body);
+        Err(anyhow!("{msg}")).context(format!("hub returned {status}"))
+    }
+
+    pub fn port(&self) -> u16 {
+        self.base
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(DEFAULT_PORT)
+    }
+
     pub async fn post_empty(&self, path: &str) -> Result<()> {
         let res = self.req(reqwest::Method::POST, path).send().await?;
         res.error_for_status()?;

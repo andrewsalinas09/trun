@@ -304,3 +304,22 @@ exactly what the live check saw.
 **Consequences:** Checks must guard `!= None` before comparing aggregates (the docs'
 examples do). Sampled series (process, host, GPU) are live-only until samples are
 recorded (M4).
+
+## D27 · Remote hosts: a full daemon per host, mirrored over an ssh port forward (2026-09-30)
+
+**Context:** The design called for `trun agent --stdio` speaking a separate
+MessagePack protocol over an SSH channel, with a spool and acks. Building M4 showed
+that each host already has everything that design needed: a supervisor, checks, a
+durable per-run event log with `seq`, and an HTTP + SSE API with resume by `seq`.
+**Decision:** Each host runs the ordinary trun daemon. The hub gets its port and
+token with `ssh <host> trun hub ensure --json`, forwards the port with `ssh -N -L`,
+and mirrors remote runs (keeping ids and `seq`) into its own agent and store by
+pulling event streams from the highest seq it has. Remote timestamps are shifted by
+the measured clock offset. Commands are forwarded, and panels are read on the host.
+Links use whatever ssh client and config the user already has (`--ssh "wsl ssh"`).
+**Consequences:** One protocol, one code path. A remote run is inspected with the
+same CLI, UI, and `trun wait` as a local one. The host keeps working, and keeps its
+own history, when the desktop is off. Remote exec in SSH mode is exactly ssh access.
+Join mode (hosts the hub can't ssh into) will carry the same API over WSS. Summaries
+and events travel on separate streams, so the mirror applies lifecycle events to the
+summary and never lets a stale summary regress a finished run.

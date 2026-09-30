@@ -36,6 +36,8 @@ pub fn router(state: AppState) -> Router {
         .route("/runs/{id}/panels", get(run_panels))
         .route("/runs/{id}/panels/stream", get(panels_stream))
         .route("/projects", get(list_projects))
+        .route("/hosts", get(list_hosts).post(add_host))
+        .route("/hosts/{name}", axum::routing::delete(remove_host))
         .route("/stream", get(fleet_stream))
         .route("/shutdown", post(shutdown))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
@@ -186,6 +188,7 @@ async fn health(State(st): State<AppState>) -> Json<HealthInfo> {
         pid: std::process::id(),
         data_dir: st.data_dir.clone(),
         started_at: st.started_at,
+        now: trun_proto::now_ms(),
     })
 }
 
@@ -198,6 +201,26 @@ async fn create_run(
     State(st): State<AppState>,
     Json(req): Json<CreateRun>,
 ) -> ApiResult<(StatusCode, Json<RunSummary>)> {
+    // Remote run: forward to the host's daemon, then mirror what it returns.
+    if let Some(host) = req.host.clone().filter(|h| !h.is_empty() && h != "local") {
+        if !st.links.has(&host) {
+            return Err(ApiErr(
+                StatusCode::BAD_REQUEST,
+                format!("unknown host '{host}' (see `trun hosts`)"),
+            ));
+        }
+        let client = remote_client(&st, &host).await?;
+        let mut remote_req = req.clone();
+        remote_req.host = None;
+        let mut summary: RunSummary = client
+            .post_json("/runs", &remote_req)
+            .await
+            .map_err(|e| ApiErr(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+        st.links.localize(&host, &mut summary);
+        st.agent.mirror_summary(&host, summary.clone());
+        let mirrored = st.agent.summary(&summary.id).unwrap_or(summary);
+        return Ok((StatusCode::CREATED, Json(mirrored)));
+    }
     let agent = st.agent.clone();
     let summary = tokio::task::spawn_blocking(move || agent.start(req))
         .await?
@@ -510,6 +533,16 @@ async fn cancel_run(
 ) -> ApiResult<Json<RunSummary>> {
     let run = resolve(&st, &id).await?;
     let req = body.map(|b| b.0).unwrap_or_default();
+    if let Some(host) = run.via.clone() {
+        let client = remote_client(&st, &host).await?;
+        let mut s: RunSummary = client
+            .post_json(&format!("/runs/{}/cancel", run.id), &req)
+            .await
+            .map_err(|e| ApiErr(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+        st.links.localize(&host, &mut s);
+        st.agent.mirror_summary(&host, s.clone());
+        return Ok(Json(s));
+    }
     if !st.agent.cancel(&run.id, req.force) {
         return Err(ApiErr(
             StatusCode::CONFLICT,
@@ -576,20 +609,26 @@ fn load_panels(st: &AppState, run: &RunSummary) -> crate::panels::PanelSet {
     )
 }
 
-async fn run_panels(
-    State(st): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<crate::panels::PanelSet>> {
+async fn run_panels(State(st): State<AppState>, Path(id): Path<String>) -> ApiResult<Response> {
     let run = resolve(&st, &id).await?;
+    if let Some(host) = &run.via {
+        let client = remote_client(&st, host).await?;
+        let v: serde_json::Value = client
+            .get_json(&format!("/runs/{}/panels", run.id))
+            .await
+            .map_err(|e| ApiErr(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+        return Ok(Json(v).into_response());
+    }
     let st2 = st.clone();
-    Ok(Json(
-        tokio::task::spawn_blocking(move || load_panels(&st2, &run)).await?,
-    ))
+    Ok(Json(tokio::task::spawn_blocking(move || load_panels(&st2, &run)).await?).into_response())
 }
 
 /// The run's panel set now, then again every time a panel or dashboard file changes.
 async fn panels_stream(State(st): State<AppState>, Path(id): Path<String>) -> ApiResult<Response> {
     let run = resolve(&st, &id).await?;
+    if let Some(host) = run.via.clone() {
+        return proxy_remote_panels(&st, &host, &run.id).await;
+    }
     let (mut project_rx, mut global_rx) = st
         .watcher
         .subscribe(run.config_root.as_deref().map(std::path::Path::new));
@@ -622,6 +661,87 @@ async fn panels_stream(State(st): State<AppState>, Path(id): Path<String>) -> Ap
     Ok(Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response())
+}
+
+/// The link to `host`, waiting briefly if it is still connecting.
+async fn remote_client(st: &AppState, host: &str) -> ApiResult<crate::remote::RemoteClient> {
+    st.links
+        .connected(host)
+        .await
+        .map_err(|e| ApiErr(StatusCode::SERVICE_UNAVAILABLE, e))
+}
+
+/// Remote runs' panel files live on their host: relay its panels stream.
+async fn proxy_remote_panels(st: &AppState, host: &str, run_id: &str) -> ApiResult<Response> {
+    let client = remote_client(st, host).await?;
+    let mut upstream = client
+        .sse(&format!("/runs/{run_id}/panels/stream"))
+        .await
+        .map_err(|e| ApiErr(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    let (tx, rx) = mpsc::channel::<Result<SseEvent, Infallible>>(8);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                msg = upstream.next() => match msg {
+                    Ok(Some((event, data))) => {
+                        if tx.send(Ok(SseEvent::default().event(event).data(data))).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ => return,
+                },
+                _ = tx.closed() => return,
+            }
+        }
+    });
+    Ok(Sse::new(ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response())
+}
+
+async fn list_hosts(State(st): State<AppState>) -> Json<Vec<trun_proto::HostState>> {
+    Json(st.links.states())
+}
+
+async fn add_host(
+    State(st): State<AppState>,
+    Json(mut h): Json<trun_proto::HostConfig>,
+) -> ApiResult<StatusCode> {
+    h.name = h.name.trim().to_string();
+    if h.name.is_empty()
+        || h.name == "local"
+        || !h
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    {
+        return Err(ApiErr(
+            StatusCode::BAD_REQUEST,
+            "host names use letters, digits, '-', '_' or '.' (and 'local' is reserved)".into(),
+        ));
+    }
+    if h.target.trim().is_empty() {
+        h.target = h.name.clone();
+    }
+    if h.ssh.is_empty() {
+        h.ssh = vec!["ssh".into()];
+    }
+    if h.trun_path.trim().is_empty() {
+        h.trun_path = ".local/bin/trun".into();
+    }
+    st.links.add(h)?;
+    Ok(StatusCode::CREATED)
+}
+
+async fn remove_host(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    if st.links.remove(&name)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiErr(StatusCode::NOT_FOUND, format!("no host '{name}'")))
+    }
 }
 
 async fn list_projects(

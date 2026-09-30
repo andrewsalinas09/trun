@@ -3575,6 +3575,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures-util",
+ "gethostname",
  "libc",
  "open",
  "reqwest",
@@ -3632,6 +3633,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
  "dirs",
  "futures-util",
  "mime_guess",
@@ -3639,6 +3641,7 @@ dependencies = [
  "notify-rust",
  "rand 0.9.5",
  "regex",
+ "reqwest",
  "rust-embed",
  "serde",
  "serde_json",

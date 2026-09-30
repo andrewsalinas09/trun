@@ -113,6 +113,30 @@ Deferred:
 Pulling the network for 5 minutes loses no metrics. The Pi run is started from the
 desktop CLI.
 
+**Status: SSH mode done (2026-09-30).** The design changed to a full daemon per host
+mirrored over an ssh port forward (D27). Verified from Windows against a Raspberry
+Pi (aarch64, static musl build, reached through `--ssh "wsl ssh"`):
+- `trun hosts add pi --install` uploads the binary, starts the daemon, and shows the
+  host online with its platform and clock skew (2 min, corrected).
+- `trun run --host pi` streams output live and passes back the exit code. Steps,
+  metrics, alerts, the project's dashboard and panels, and NaN markers show in the
+  desktop UI.
+- A remote stall wakes a local `trun wait` (exit 2), and cancel works from the
+  desktop.
+- Killing the tunnel mid-run: the host shows offline, active runs get a "host
+  unreachable" alert, and the link reconnects. All 40 of 40 lines were backfilled.
+- An upgraded binary on the host is detected and its idle daemon restarted.
+
+Not done yet, carried forward:
+- Join mode (outbound WSS).
+- NVML GPU sampling, per-process attribution, and GPU default checks.
+- Agent-side downsampling.
+- `install-service` (systemd --user with linger, Scheduled Task, LaunchAgent),
+  `install.sh`, `trun doctor`.
+- Recording samples for check replay.
+- The spool size cap.
+- A cloud GPU box, which needs a manual test once one is rented.
+
 ## M5 · MCP
 
 - `trun mcp` with run, notes, structure, errors, and fleet tools

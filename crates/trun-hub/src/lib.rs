@@ -9,6 +9,7 @@ pub mod config;
 mod notify;
 pub mod panels;
 pub mod paths;
+pub mod remote;
 mod routes;
 mod ui;
 mod watcher;
@@ -44,10 +45,13 @@ pub struct AppState {
     /// `$TRUN_HOME`: global panels and dashboards live here.
     pub home: std::path::PathBuf,
     pub watcher: watcher::ConfigWatcher,
+    pub links: remote::Links,
 }
 
 /// Run the hub until Ctrl-C or `POST /api/shutdown`.
 pub async fn serve(cfg: HubConfig) -> Result<()> {
+    // Pin the build id now, before an upgrade can replace the binary on disk.
+    let _ = trun_proto::build_id();
     let token = cfg.paths.load_or_create_token()?;
     let data_dir = cfg.paths.data_dir();
     let store = Store::open(&data_dir)?;
@@ -83,6 +87,8 @@ pub async fn serve(cfg: HubConfig) -> Result<()> {
         }),
     };
     let agent = Agent::new(store.clone(), url.clone(), agent_config);
+    let links = remote::Links::new(agent.clone(), store.clone());
+    links.start_all();
     let state = AppState {
         agent,
         store,
@@ -93,6 +99,7 @@ pub async fn serve(cfg: HubConfig) -> Result<()> {
         shutdown: Arc::new(Notify::new()),
         home: cfg.paths.home.clone(),
         watcher: watcher::ConfigWatcher::new(cfg.paths.home.clone()),
+        links: links.clone(),
     };
 
     cfg.paths.write_hub_info(&HubInfo {

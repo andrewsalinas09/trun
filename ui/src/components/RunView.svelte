@@ -74,7 +74,28 @@
     return run?.steps.find((s) => s.id === id);
   }
 
+  // Events are applied in batches: a replay burst or a chatty run then costs one
+  // render per batch instead of one per event (which starved the main thread).
+  const BATCH_MS = 50;
+  let queued: RunEvent[] = [];
+  let batchTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function enqueue(ev: RunEvent) {
+    queued.push(ev);
+    batchTimer ??= setTimeout(() => {
+      batchTimer = null;
+      const batch = queued;
+      queued = [];
+      for (const e of batch) onEvent(e);
+    }, BATCH_MS);
+  }
+
+  let maxLineSeq = 0;
+  const seenMessages = new Set<number>();
+
   function addMessage(ev: RunEvent) {
+    if (seenMessages.has(ev.seq)) return;
+    seenMessages.add(ev.seq);
     if (ev.kind === "note") messages.push({ seq: ev.seq, ts: ev.ts, level: "note", text: ev.text });
     else if (ev.kind === "log") messages.push({ seq: ev.seq, ts: ev.ts, level: ev.level, text: ev.text });
     else if (ev.kind === "check_error")
@@ -113,6 +134,10 @@
     run.last_seq = ev.seq;
     switch (ev.kind) {
       case "output":
+        // The stream resumes from the summary's consistency point, which can be
+        // before lines already loaded from the log tail.
+        if (ev.seq <= maxLineSeq) break;
+        maxLineSeq = ev.seq;
         append(toView(ev));
         run.last_output_at = ev.ts;
         break;
@@ -210,9 +235,12 @@
         hasEarlier = page.lines.length >= INITIAL_TAIL;
         store = new MetricStore(r.id, (s) => (series = s));
         metrics = store;
-        const since = Math.max(page.lines.length ? page.lines[page.lines.length - 1].seq : 0, msgs.length ? msgs[msgs.length - 1].seq : 0);
+        maxLineSeq = page.lines.length ? page.lines[page.lines.length - 1].seq : 0;
+        // Resume from the event the summary is consistent with (for mirrored remote
+        // runs the summary can lag the stream); duplicates are dropped above.
+        const since = r.last_seq;
         close = subscribe(`/runs/${r.id}/events?since_seq=${since}`, {
-          event: (d) => onEvent(d as RunEvent),
+          event: (d) => enqueue(d as RunEvent),
           end: (d) => {
             const final = d as RunSummary;
             run = final;
@@ -231,6 +259,7 @@
     })();
     return () => {
       cancelled = true;
+      if (batchTimer) clearTimeout(batchTimer);
       close?.();
       closePanels?.();
       store?.dispose();

@@ -25,6 +25,12 @@ const HUB_MIGRATIONS: &[&str] = &[
      CREATE INDEX runs_lifecycle ON runs(lifecycle);
      CREATE INDEX runs_name      ON runs(name, created_at DESC);
      CREATE INDEX runs_project   ON runs(project, created_at DESC);",
+    // v2: remote hosts
+    "CREATE TABLE hosts (
+        name       TEXT PRIMARY KEY,
+        config     TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+     ) STRICT;",
 ];
 
 const PROJECT_MIGRATIONS: &[&str] = &[

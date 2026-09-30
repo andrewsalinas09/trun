@@ -88,9 +88,11 @@ trun emit step-end compile ok
 ## Daemons
 
 ```sh
-trun hub [--listen 0.0.0.0:7317] [--data-dir …]
-trun hosts add <ssh-host> [--install]                 # SSH mode: hub dials the host
-trun hosts remove <host>
+trun hub start|stop|status                            # auto-starts on first use
+trun hub ensure [--json]                               # start if needed; print port + token (used over ssh)
+trun hosts                                             # status, platform, clock skew, active runs
+trun hosts add <name> [--target user@host] [--ssh "wsl ssh"] [--trun-path p] [--install [--binary f]]
+trun hosts rm <name>
 trun hub token create --name gpu1 [--ttl 1h] [--allow-exec]   # join mode
 trun hub token list | revoke <id>
 

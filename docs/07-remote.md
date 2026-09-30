@@ -26,23 +26,52 @@ private network such as **Tailscale or WireGuard**.
 | **SSH** (default) | Hub → host, over your SSH config | Your SSH keys | Any box you can already `ssh` into: cloud GPUs, the Pi, servers |
 | **Join** | Agent → hub, WSS over tailnet/LAN | Per-agent credential from a join token | Boxes that can reach your tailnet but that you can't SSH into from the hub (e.g. behind double NAT without Tailscale SSH) |
 
-### SSH mode
+### SSH mode (implemented in M4)
 
 ```sh
 trun hosts add gpu1                   # uses the "gpu1" entry in ~/.ssh/config
 trun hosts add gpu1 --install         # also copies the right trun binary to the host
+trun hosts add pi --ssh "wsl ssh"     # use another ssh client (here: WSL's, with its config and keys)
+trun hosts                            # online/offline, platform, clock skew, active runs
+trun run --host gpu1 --cwd ~/proj -- python train.py
 ```
 
-The hub opens an SSH connection and starts `trun agent --stdio` on the remote. The
-protocol runs over that SSH channel, and the remote agent keeps running as a user
-daemon after the channel drops. On reconnect the hub attaches again and the spool
-resumes. The hub retries with backoff while the host is unreachable. No tokens and no
-listening ports are involved: SSH is the auth.
+Every host runs the **same trun daemon** as the desktop: its own supervisor, checks,
+and SQLite store. It works fully without the hub. The hub keeps one link per host:
 
-`--install` detects the remote OS and architecture, uploads the matching static
-binary, and installs the user service (see *Daemon model* below).
+1. `ssh <target> <trun_path> hub ensure --json` starts the remote daemon if needed
+   (upgrading it if the installed binary changed) and prints its loopback port and
+   token.
+2. `ssh -N -L 127.0.0.1:<free local port>:127.0.0.1:<remote port>` forwards that
+   port. The remote daemon still only listens on its own loopback. The tunnel
+   requests carry the remote port in `Host`, so the daemon's Host check passes.
+3. The hub measures the clock offset (`/api/health` `now`, midpoint of the round
+   trip) and shifts all remote timestamps onto the hub's clock. The Pi used in
+   testing ran two minutes ahead.
+4. It subscribes to the remote fleet stream, then reconciles the recent run list,
+   and **mirrors** each remote run into the local agent and store. Run ids and event
+   `seq` numbers are kept, so a mirrored run looks like a local run to the CLI, UI,
+   `trun wait`, and (later) MCP. Its `via` field names the host.
+5. Commands for a mirrored run (start, cancel) are forwarded to the host's API.
+   Panels are read on the host, where the project files live: the run's panel
+   stream is proxied.
 
-### Join mode
+ssh runs with `BatchMode=yes` (it never prompts) and a connect timeout. Errors are
+translated into a next step: "permission denied" (keys), "could not resolve" (try
+`--ssh "wsl ssh"` when the config lives in WSL), and "trun not found" (`--install`).
+The link retries with backoff. A request that arrives while the link is still
+connecting waits up to 20 s instead of failing.
+
+`--install` runs `uname -sm` on the host, picks the matching static binary
+(`$TRUN_HOME/dist/trun-<triple>`, or `--binary`), and uploads it over the same ssh
+command's stdin with an atomic rename. No scp or sftp is needed.
+
+When a link drops, mirrored active runs get a hub-side `stalled` alert ("host 'pi'
+unreachable: …"), so `trun wait --until stalled` wakes up. The run itself keeps
+going on the host. After reconnecting, the alert clears and the missed events are
+backfilled.
+
+### Join mode (planned)
 
 On the hub:
 
@@ -64,11 +93,14 @@ The join token is exchanged for a long-lived per-agent credential, stored at
 
 ## Transport
 
-- The same MessagePack-framed protocol runs over either an **SSH channel** (SSH mode)
-  or **WebSocket** (join mode; TLS unless the link is already a WireGuard tunnel).
+- **SSH mode:** the host daemon's own HTTP + SSE API (the one the local CLI and UI
+  use) runs through an ssh port forward. No second protocol exists, and anything the
+  hub can do locally works remotely. The ssh process's liveness is the heartbeat;
+  SSE keep-alives run every 15 s.
+- **Join mode (planned):** the same API over an outbound WebSocket (TLS unless the
+  link is already a WireGuard tunnel).
 - The hub listens only on localhost and, if configured, the tailnet interface. It
   never listens on a public address.
-- **Heartbeats** every 15 s in both directions.
 
 ## Daemon model
 
@@ -98,15 +130,23 @@ helper with a narrow IPC surface. The main daemon stays unprivileged.
 
 ## Spool & resume
 
-- Every event gets a per-run monotonically increasing `seq`, assigned by the agent.
-- Events are written to the agent's SQLite spool **before** sending.
-- The hub acknowledges by `(run_id, seq)`, and acknowledged events become eligible
-  for spool pruning.
-- On reconnect the agent sends `resume {run_id: last_acked_seq}` per active run and
-  replays the gap. The UI marks the gap period as "backfilled".
-- Spool limits: a size cap (default 1 GB). When over the cap, the agent drops
-  `output` events for the oldest runs first, while **always keeping** metrics,
-  lifecycle, alerts, and diagnosis. It records that the drop happened.
+- Every event gets a per-run monotonically increasing `seq`, assigned by the host's
+  agent.
+- The host's own SQLite store is the spool. It is written before anything is served,
+  so nothing depends on the link being up.
+- The hub replicates by pulling: for each remote run it streams
+  `/runs/<id>/events?since_seq=<highest seq stored locally>`. After a reconnect it
+  resumes from there, so the gap is backfilled exactly once. Duplicates are dropped
+  by `seq`.
+- Summaries (lifecycle, steps, health) arrive on the fleet stream and can lag the
+  event stream. So the mirror applies lifecycle and diagnosis events to the summary
+  itself, and a lagging summary never un-finishes a run. A summary's `last_seq` is
+  the event its content is consistent with. Clients resume streams from there and
+  drop what they already have.
+- Planned: a spool size cap (default 1 GB). When over the cap, drop `output` events
+  for the oldest runs first, while **always keeping** metrics, lifecycle, alerts,
+  and diagnosis, and record that the drop happened. Also planned: a "backfilled"
+  marker in the UI.
 
 ## Remote execution
 
@@ -116,8 +156,10 @@ The hub (and therefore the CLI and MCP) can ask an agent to start a run:
 trun run --host gpu1 --cwd ~/proj -- python train.py
 ```
 
-In **SSH mode** this is on by default, because the hub can already run anything there
-through SSH. In **join mode** it is **off by default**: the agent must be enrolled with
+`--cwd` is a path on the host. Relative paths and `~` are resolved from the host
+user's home (default: the home directory). The run's `.trun/` config, checks, and
+panels come from the host's copy of the project. In **SSH mode** this is on by
+default, because the hub can already run anything there through SSH. In **join mode** it is **off by default**: the agent must be enrolled with
 `--allow-exec` or have `allow_exec = true` in its config. Optional `exec_allowlist` globs restrict which
 commands may be started remotely. Cancel, note, and `::expect` overrides are always
 allowed.

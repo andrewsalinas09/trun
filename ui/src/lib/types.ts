@@ -168,6 +168,19 @@ export interface MetricSeries {
   downsampled: boolean;
 }
 
+export interface HostState {
+  name: string;
+  target: string;
+  ssh: string[];
+  trun_path: string;
+  status: "connecting" | "online" | "offline";
+  error: string | null;
+  info: { hostname: string; os: string; arch: string; version: string } | null;
+  last_seen: number | null;
+  active_runs: number;
+  clock_offset_ms: number | null;
+}
+
 export interface ProjectInfo {
   name: string;
   run_count: number;

@@ -22,15 +22,23 @@ pub type Millis = i64;
 /// Identity of the current executable: size and modification time. A hub running
 /// from a copy (see the CLI's daemon module) reports the same value, because file
 /// copies preserve the modification time.
+///
+/// Computed once and remembered: after an upgrade replaces the binary on disk, a
+/// still-running process must keep reporting the build it *is* (on Linux its
+/// `/proc/self/exe` then points at a deleted file), so a newer CLI can tell it's stale.
 pub fn build_id() -> Option<String> {
-    let meta = std::fs::metadata(std::env::current_exe().ok()?).ok()?;
-    let mtime = meta
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    Some(format!("{:x}-{:x}", meta.len(), mtime))
+    static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let meta = std::fs::metadata(std::env::current_exe().ok()?).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        Some(format!("{:x}-{:x}", meta.len(), mtime))
+    })
+    .clone()
 }
 
 pub fn now_ms() -> Millis {
@@ -334,6 +342,9 @@ pub struct RunSummary {
     /// Open check alerts (the worst one sets `health`).
     #[serde(default)]
     pub alerts: Vec<Alert>,
+    /// Set on the hub for runs mirrored from a remote host: the host link's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 impl RunSummary {
@@ -357,6 +368,9 @@ pub struct HealthInfo {
     pub pid: u32,
     pub data_dir: String,
     pub started_at: Millis,
+    /// The daemon's clock, for estimating remote clock offsets.
+    #[serde(default)]
+    pub now: Millis,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -378,6 +392,97 @@ pub struct CreateRun {
     /// Extra check files (absolute paths on the run's host).
     #[serde(default)]
     pub checks: Vec<String>,
+    /// Run on this remote host (a `trun hosts` name) instead of locally. `cwd` is
+    /// then a path on that host; `~` means its home directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+/// What `trun hub ensure --json` prints: how to reach a daemon (used over SSH).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonInfo {
+    pub port: u16,
+    pub token: String,
+    pub version: String,
+    #[serde(default)]
+    pub build: Option<String>,
+    pub hostname: String,
+    pub os: String,
+    pub arch: String,
+    pub pid: u32,
+}
+
+/// A remote host as configured on the hub.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HostConfig {
+    /// Short name used everywhere (`trun run --host pi`).
+    pub name: String,
+    /// SSH destination (defaults to `name`): a `~/.ssh/config` alias or user@host.
+    pub target: String,
+    /// The SSH client to run, e.g. `["ssh"]` or `["wsl", "ssh"]`.
+    pub ssh: Vec<String>,
+    /// trun on the remote host (relative paths are from the remote home).
+    pub trun_path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostStatus {
+    Connecting,
+    Online,
+    Offline,
+}
+
+/// A host as reported by `GET /api/hosts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostState {
+    #[serde(flatten)]
+    pub config: HostConfig,
+    pub status: HostStatus,
+    /// Why it's offline (last connection error), with a hint when known.
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub info: Option<DaemonInfo>,
+    #[serde(default)]
+    pub last_seen: Option<Millis>,
+    #[serde(default)]
+    pub active_runs: u32,
+    /// Remote clock minus hub clock (ms). Mirrored timestamps are shifted by it.
+    #[serde(default)]
+    pub clock_offset_ms: Option<Millis>,
+}
+
+impl RunSummary {
+    /// Move every timestamp by `d` ms (mirroring a host whose clock is off).
+    pub fn shift_times(&mut self, d: Millis) {
+        if d == 0 {
+            return;
+        }
+        let sh = |t: &mut Millis| *t += d;
+        let sho = |t: &mut Option<Millis>| {
+            if let Some(x) = t {
+                *x += d;
+            }
+        };
+        sh(&mut self.created_at);
+        sho(&mut self.started_at);
+        sho(&mut self.ended_at);
+        sho(&mut self.last_output_at);
+        sho(&mut self.last_activity_at);
+        for s in &mut self.steps {
+            sh(&mut s.started_at);
+            sho(&mut s.ended_at);
+            sho(&mut s.progressed_at);
+        }
+        for m in self.metrics.values_mut() {
+            sh(&mut m.ts);
+        }
+        for a in &mut self.alerts {
+            sh(&mut a.opened_at);
+            sh(&mut a.last_at);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

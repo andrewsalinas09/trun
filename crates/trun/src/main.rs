@@ -6,6 +6,7 @@ mod daemon;
 mod digest;
 mod emit;
 mod fmt;
+mod hosts;
 mod printer;
 mod wait;
 
@@ -60,6 +61,11 @@ enum Cmd {
         #[command(subcommand)]
         action: checkcmd::CheckAction,
     },
+    /// Remote hosts reachable over SSH
+    Hosts {
+        #[command(subcommand)]
+        action: Option<hosts::HostsAction>,
+    },
     /// List projects
     Projects,
     /// Report structure from inside a run (step-begin, step-end, progress, metric,
@@ -102,6 +108,9 @@ struct RunArgs {
     /// Run under a pseudo-terminal (programs see a TTY; stdout and stderr merge)
     #[arg(long)]
     pty: bool,
+    /// Run on a remote host (see `trun hosts`); --cwd is then a path there (default: its home)
+    #[arg(long)]
+    host: Option<String>,
     /// Extra check file(s) for this run (repeatable)
     #[arg(long = "check", value_name = "FILE.star")]
     checks: Vec<std::path::PathBuf>,
@@ -162,6 +171,11 @@ enum HubAction {
         #[arg(long)]
         foreground: bool,
     },
+    /// Start the hub if needed and print how to reach it (used by remote hubs over SSH)
+    Ensure {
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop the running hub
     Stop,
     /// Show hub status
@@ -191,6 +205,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
         Cmd::Ls(args) => ls(&paths, args).await,
         Cmd::Status { run } => status(&paths, &run).await,
         Cmd::Wait(args) => wait::wait(&paths, args).await,
+        Cmd::Hosts { action } => hosts::run(&paths, action.unwrap_or(hosts::HostsAction::Ls)).await,
         Cmd::Check { action } => checkcmd::run(&paths, action).await,
         Cmd::Logs(args) => logs(&paths, args).await,
         Cmd::Cancel { run, force } => {
@@ -269,6 +284,26 @@ async fn hub(paths: &Paths, action: HubAction) -> Result<ExitCode> {
             println!("hub running at {} (pid {})", c.base, h.pid);
             Ok(ExitCode::SUCCESS)
         }
+        HubAction::Ensure { json } => {
+            let c = Client::connect(paths, true).await?;
+            let h = c.health().await?;
+            let info = trun_proto::DaemonInfo {
+                port: c.port(),
+                token: c.token().to_string(),
+                version: h.version.clone(),
+                build: h.build.clone(),
+                hostname: gethostname::gethostname().to_string_lossy().into_owned(),
+                os: std::env::consts::OS.into(),
+                arch: std::env::consts::ARCH.into(),
+                pid: h.pid,
+            };
+            if json {
+                println!("{}", serde_json::to_string(&info)?);
+            } else {
+                println!("hub {} at {} (pid {})", info.version, c.base, info.pid);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         HubAction::Stop => {
             let c = match Client::connect(paths, false).await {
                 Ok(c) => c,
@@ -320,13 +355,21 @@ fn init_logging() {
 }
 
 async fn run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
-    let cwd = match args.cwd {
-        Some(d) => d,
-        None => std::env::current_dir()?,
+    let remote = args.host.as_deref().is_some_and(|h| h != "local");
+    let cwd = if remote {
+        // A path on the remote host: pass it through untouched (`~` = its home).
+        args.cwd
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "~".into())
+    } else {
+        let cwd = match args.cwd {
+            Some(d) => d,
+            None => std::env::current_dir()?,
+        };
+        let cwd = std::fs::canonicalize(&cwd)
+            .with_context(|| format!("working directory {}", cwd.display()))?;
+        strip_verbatim(&cwd)
     };
-    let cwd = std::fs::canonicalize(&cwd)
-        .with_context(|| format!("working directory {}", cwd.display()))?;
-    let cwd = strip_verbatim(&cwd);
     let env = args
         .env
         .iter()
@@ -356,6 +399,7 @@ async fn run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         pty: args.pty,
         no_default_checks: args.no_default_checks,
         checks,
+        host: args.host.clone(),
     };
     let r: RunSummary = c.post("/runs", &req).await?;
 

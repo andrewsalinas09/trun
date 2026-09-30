@@ -63,15 +63,17 @@ trun wait train-v3 --until done,failed,stalled
 
 ## Status
 
-**M1–M3 are implemented** on Windows and Linux:
+**M1–M4 (SSH mode) are implemented** on Windows and Linux:
 - **M1:** the local supervisor, hub, SQLite store, and web UI.
 - **M2:** structure: the `::` protocol, built-in parsers, the side channel, `--pty`,
   charts, and hot-reloading panels.
 - **M3:** checks: stall/zombie/NaN/disk/memory detection in Starlark, alerts, health,
   desktop notifications, `trun wait`, and check replay.
+- **M4:** remote hosts over SSH. Each host runs its own daemon, and the desktop
+  mirrors its runs live (reconnects, backfill, clock-skew correction, `--install`).
 
-See the [roadmap](docs/10-roadmap.md). Remote hosts (`trun hosts`) and MCP come in
-later milestones. The examples above that use them describe the design.
+See the [roadmap](docs/10-roadmap.md). MCP comes next. Examples above that use it
+describe the design.
 
 What works today:
 
@@ -86,6 +88,8 @@ trun cancel nightly [--force]        # stop the whole process tree
 trun emit progress build 3 10        # report structure from shell scripts
 trun wait nightly --until done,stalled   # block until something happens (exit code says what)
 trun check test my.star --run nightly    # replay a check against a recorded run
+trun hosts add pi --install          # a box you can ssh into (config alias or user@host)
+trun run --host pi --cwd proj -- python train.py   # run there, watch here
 trun ui [run]                        # open the web UI
 trun hub start|stop|status           # the hub auto-starts on first use
 ```

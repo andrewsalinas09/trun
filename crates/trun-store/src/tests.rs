@@ -225,6 +225,40 @@ fn metric_series_keep_nan_and_downsample() {
 }
 
 #[test]
+fn hosts_crud_and_remote_runs_survive_restart() {
+    let dir = tempdir();
+    let store = Store::open(&dir).unwrap();
+    let h = trun_proto::HostConfig {
+        name: "pi".into(),
+        target: "pi".into(),
+        ssh: vec!["wsl".into(), "ssh".into()],
+        trun_path: ".local/bin/trun".into(),
+    };
+    store.put_host(&h).unwrap();
+    assert_eq!(store.hosts().unwrap()[0].ssh, vec!["wsl", "ssh"]);
+    let mut remote = run("01REMOTE", "p", "r", Lifecycle::Running);
+    remote.via = Some("pi".into());
+    store.upsert_run(&remote).unwrap();
+    store
+        .upsert_run(&run("01LOCAL", "p", "l", Lifecycle::Running))
+        .unwrap();
+    store.flush();
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    let lost = store.mark_orphans_lost().unwrap();
+    assert_eq!(
+        lost.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        vec!["01LOCAL"]
+    );
+    assert_eq!(
+        store.get_run("01REMOTE").unwrap().unwrap().lifecycle,
+        Lifecycle::Running
+    );
+    assert!(store.delete_host("pi").unwrap());
+    assert!(store.hosts().unwrap().is_empty());
+}
+
+#[test]
 fn file_stems_are_safe_and_distinct() {
     assert_eq!(file_stem("detector"), "detector");
     assert_eq!(file_stem("a/b"), "a%2Fb");

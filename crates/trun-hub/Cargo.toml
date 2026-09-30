@@ -26,3 +26,5 @@ trun-parse.workspace = true
 notify = "8"
 toml = "0.9"
 notify-rust = "4"
+reqwest.workspace = true
+bytes = "1"
